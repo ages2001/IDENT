@@ -1,0 +1,57 @@
+#
+# TXTSETUP.OEM - IDENT PATA/SATA IDE Driver for NT 3.1 - 4.0 text-mode setup
+#
+# This file is used during text-mode setup to install the IDENT driver
+# for boot from IDE controllers (PCI, compatibility or native mode, and
+# ISA).
+#
+
+[Disks]
+
+# <description> is a descriptive name for a disk, used when
+#   prompting for the disk
+# <tagfile> is a file whose presence allows setup to recognize
+#   that the disk is inserted.
+# <directory> is where the files are located on the disk.
+
+d1 = "IDENT IDE Driver Disk", \disk1, \
+
+
+[Defaults]
+
+# This section lists the default selection for the 'scsi' component.
+
+scsi = IDENT
+
+
+[scsi]
+
+# <id> is the unique string for the option
+# <description> is a text string, presented to the user in a menu
+# <key_name> gives the name of the key to be created for the component in
+#   HKEY_LOCAL_MACHINE\ControlSet001\Services
+
+IDENT = "IDENT PATA/SATA IDE Storage Controller (ages2001)", IDENT
+
+
+[Files.scsi.IDENT]
+
+# <file_type> is one of driver, port, class, dll, hal, inf, or detect.
+# <source_disk> identifies where the file is to be copied from, and must
+#   match an entry in the [Disks] section.
+# <filename> is the name of the file.
+
+driver = d1, IDENT.sys, IDENT
+
+
+[Config.scsi.IDENT]
+
+# This section specifies values to be set in the registry for
+# this component option. <key_name> is relative to the services node
+# for this device; empty means the services node itself.
+
+value = "", Tag, REG_DWORD, 40
+value = "", Type, REG_DWORD, 1
+value = "", Start, REG_DWORD, 0
+value = "", Group, REG_SZ, "SCSI Miniport"
+value = "", ErrorControl, REG_DWORD, 1

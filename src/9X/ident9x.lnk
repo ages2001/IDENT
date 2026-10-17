@@ -1,0 +1,10 @@
+-machine:i386
+-align:0x200
+-subsystem:native,4.00
+-debug:partial
+-base:0x10000
+-entry:DriverEntry
+-out:ident9x.mpd
+-map:ident9x.map
+-export:DriverEntry
+idemain.obj idecmd.obj idesatl.obj C:\DDK\BLOCK\LIB\scsiport.lib

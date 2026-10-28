@@ -211,6 +211,58 @@ installtheoption = +
             endif
         EndForListDo
 
+        ; CD-ROM drives need the CD-ROM class driver (scsicdrm on NT 3.x,
+        ; cdrom on NT 4.0) and CDFS: NT 3.1 has no IDE CD-ROM support, so an
+        ; installation on IDE leaves them at Start 4. CDFS is left alone when
+        ; a file system recognizer loads it (cdfs_rec on NT 3.x, fs_rec).
+        set ClassDone = FALSE
+        ForListDo {scsicdrm, cdrom}
+            ifstr(i) $(ClassDone) == FALSE
+                set ClassKey = ""
+                OpenRegKey $(!REG_H_LOCAL) "" "SYSTEM\CurrentControlSet\Services\"$($) 33554432 ClassKey
+                ifstr(i) $(ClassKey) != ""
+                    set OldList = {}
+                    GetRegValue $(ClassKey) "Start" OldList
+                    ifint $(RegLastError) == 0
+                        ifint *($(OldList), 4) == 4
+                            SetRegValue $(ClassKey) {Start, 0, $(!REG_VT_DWORD), 1}
+                        endif
+                    endif
+                    CloseRegKey $(ClassKey)
+                    set ClassDone = TRUE
+                endif
+            endif
+        EndForListDo
+        set RecognizerOn = FALSE
+        ForListDo {cdfs_rec, fs_rec}
+            set RecKey = ""
+            OpenRegKey $(!REG_H_LOCAL) "" "SYSTEM\CurrentControlSet\Services\"$($) 33554432 RecKey
+            ifstr(i) $(RecKey) != ""
+                set OldList = {}
+                GetRegValue $(RecKey) "Start" OldList
+                ifint $(RegLastError) == 0
+                    ifint *($(OldList), 4) < 4
+                        set RecognizerOn = TRUE
+                    endif
+                endif
+                CloseRegKey $(RecKey)
+            endif
+        EndForListDo
+        ifstr(i) $(RecognizerOn) == FALSE
+            set CdfsKey = ""
+            OpenRegKey $(!REG_H_LOCAL) "" "SYSTEM\CurrentControlSet\Services\cdfs" 33554432 CdfsKey
+            ifstr(i) $(CdfsKey) != ""
+                set OldList = {}
+                GetRegValue $(CdfsKey) "Start" OldList
+                ifint $(RegLastError) == 0
+                    ifint *($(OldList), 4) == 4
+                        SetRegValue $(CdfsKey) {Start, 0, $(!REG_VT_DWORD), 1}
+                    endif
+                endif
+                CloseRegKey $(CdfsKey)
+            endif
+        endif
+
         ; The in-box IDE drivers would take the channels first (atdisk
         ; loads in the Primary disk group, atapi with an earlier tag), so
         ; they are disabled. Their previous Start is kept under the IDENT

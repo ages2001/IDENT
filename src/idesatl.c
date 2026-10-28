@@ -108,6 +108,11 @@ IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit
     dev->Spt = 0;
     dev->Cdb16 = FALSE;
     dev->DmaDir = FALSE;
+    dev->Trim = FALSE;
+    dev->TrimZeroes = FALSE;
+    dev->Smart = FALSE;
+    dev->RotationRate = 0;
+    dev->FormFactor = 0;
 
     if (dev->IdentifyValid) {
         ULONG i;
@@ -193,6 +198,17 @@ IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit
                          (id[IDW_CMDSET_SUPPORTED_EXT] & IDW83_VALID_MASK) == IDW83_VALID &&
                          (id[IDW_CMDSET_SUPPORTED_EXT] & IDW84_FUA));
 
+    /* TRIM (a 48-bit DMA command) and what the medium is */
+    dev->Trim = (BOOLEAN)(dev->Lba48 && (id[IDW_DSM_SUPPORT] & IDW169_TRIM) && id[IDW_DSM_SUPPORT] != 0xFFFF);
+    dev->TrimZeroes = (BOOLEAN)(dev->Trim && (id[IDW_ADDITIONAL_SUPPORTED] & IDW69_DETERMINISTIC_TRIM) &&
+                                (id[IDW_ADDITIONAL_SUPPORTED] & IDW69_ZERO_AFTER_TRIM));
+    if (id[IDW_ROTATION_RATE] == 1 || (id[IDW_ROTATION_RATE] >= 0x0401 && id[IDW_ROTATION_RATE] <= 0xFFFE)) {
+        dev->RotationRate = id[IDW_ROTATION_RATE];
+    }
+    dev->FormFactor = (UCHAR)(id[IDW_FORM_FACTOR] & 0x0F);
+    dev->Smart = (BOOLEAN)((id[IDW_CMDSET_SUPPORTED_1] & IDW82_SMART) && (id[IDW_CMDSET_ENABLED_1] & IDW82_SMART) &&
+                           id[IDW_CMDSET_SUPPORTED_1] != 0xFFFF);
+
     IDE_DBG((IDE_PFX "Channel %lu.%lu: LBA=%s LBA48=%s sectors=%08lX:%08lX x %lu bytes, CHS %lu/%lu/%lu, FUA=%s write cache=%s\n",
              Channel, Unit,
              dev->LbaSupported ? "yes" : "no",
@@ -201,6 +217,9 @@ IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit
              (ULONG)dev->Cylinders, (ULONG)dev->Heads, (ULONG)dev->Spt,
              dev->Fua ? "yes" : "no",
              (id[IDW_CMDSET_ENABLED_1] & IDW82_WRITE_CACHE) ? "on" : "off"));
+    IDE_DBG((IDE_PFX "Channel %lu.%lu: TRIM=%s%s rotation %04lX SMART=%s\n", Channel, Unit,
+             dev->Trim ? "yes" : "no", dev->TrimZeroes ? " (zeroes)" : "", (ULONG)dev->RotationRate,
+             dev->Smart ? "yes" : "no"));
 }
 
 /* ------------------------------------------------------------------ */
@@ -359,22 +378,72 @@ IdeExtractAtaString(IN PUSHORT IdentifyWords, IN ULONG StartWord, IN ULONG NumWo
     }
 }
 
-static VOID
-IdeHandleInquiryVpd(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+/* Peripheral device type of an ATAPI device: IDENTIFY PACKET DEVICE word 0
+   bits 12:8 (05h CD/DVD, 00h direct access such as ZIP, LS-120 or
+   SuperDisk, 07h optical memory, 01h tape); 1Fh (unknown) and a device
+   without IDENTIFY data count as CD/DVD */
+static UCHAR
+IdeAtapiDeviceType(IN PIDE_DEVICE Dev)
 {
-    UCHAR page[4 + 20];
-    ULONG len;
+    UCHAR type;
+
+    if (!Dev->IdentifyValid) return READ_ONLY_DIRECT_ACCESS_DEVICE;
+    type = (UCHAR)((Dev->Id[IDE_ID_CONFIG] >> 8) & 0x1F);
+    return (type == 0x1F) ? (UCHAR)READ_ONLY_DIRECT_ACCESS_DEVICE : type;
+}
+
+static VOID
+IdeHandleInquiryVpd(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    UCHAR page[64];
+    ULONG len, allocLen = ((ULONG)Srb->Cdb[3] << 8) | Srb->Cdb[4];
+    BOOLEAN unmap = (BOOLEAN)(Dev->Trim && Dev->UseDma && HwInit->TrimAllowed);
 
     ZeroMemoryBytes(page, sizeof(page));
-    page[0] = Dev->IsAtapi ? READ_ONLY_DIRECT_ACCESS_DEVICE : DIRECT_ACCESS_DEVICE;
+    page[0] = Dev->IsAtapi ? IdeAtapiDeviceType(Dev) : DIRECT_ACCESS_DEVICE;
     page[1] = Srb->Cdb[2];
 
+    if (Dev->IsAtapi && Srb->Cdb[2] != IDE_VPD_SUPPORTED_PAGES && Srb->Cdb[2] != IDE_VPD_SERIAL_NUMBER) {
+        IdeInvalidField(Dev, Srb);
+        return;
+    }
     switch (Srb->Cdb[2]) {
     case IDE_VPD_SUPPORTED_PAGES:
-        page[3] = 2;
         page[4] = IDE_VPD_SUPPORTED_PAGES;
         page[5] = IDE_VPD_SERIAL_NUMBER;
-        len = 4 + 2;
+        len = 6;
+        if (!Dev->IsAtapi) {
+            page[len++] = IDE_VPD_BLOCK_LIMITS;
+            page[len++] = IDE_VPD_BLOCK_CHARACTERISTICS;
+            page[len++] = IDE_VPD_PROVISIONING;
+        }
+        page[3] = (UCHAR)(len - 4);
+        break;
+
+    case IDE_VPD_BLOCK_LIMITS:
+        page[3] = 0x3C;
+        IdePutBigEndian32(&page[8], IDE_MAX_TRANSFER / Dev->SectorSize);
+        IdePutBigEndian32(&page[12], IDE_MAX_TRANSFER / Dev->SectorSize);
+        if (unmap) {
+            IdePutBigEndian32(&page[20], IDE_UNMAP_MAX_BLOCKS);
+            IdePutBigEndian32(&page[24], IDE_UNMAP_MAX_DESCRIPTORS);
+            IdePutBigEndian32(&page[28], 1UL << Dev->PhysExponent);
+        }
+        len = 4 + 0x3C;
+        break;
+
+    case IDE_VPD_BLOCK_CHARACTERISTICS:
+        page[3] = 0x3C;
+        page[4] = (UCHAR)(Dev->RotationRate >> 8);
+        page[5] = (UCHAR)Dev->RotationRate;
+        page[7] = Dev->FormFactor;
+        len = 4 + 0x3C;
+        break;
+
+    case IDE_VPD_PROVISIONING:
+        page[3] = 4;
+        page[5] = (UCHAR)((unmap ? 0x80 : 0) | ((unmap && Dev->TrimZeroes) ? 0x04 : 0));
+        len = 4 + 4;
         break;
 
     case IDE_VPD_SERIAL_NUMBER:
@@ -393,13 +462,13 @@ IdeHandleInquiryVpd(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
         return;
     }
 
-    if (len > Srb->Cdb[4]) len = Srb->Cdb[4];
+    if (len > allocLen) len = allocLen;
     IdeCopyToSrb(Srb, page, len);
     IdeGood(Srb);
 }
 
 static VOID
-IdeHandleInquiry(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+IdeHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
     PUSHORT id = Dev->Id;
     INQUIRYDATA inq;
@@ -407,7 +476,7 @@ IdeHandleInquiry(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
     ULONG i;
 
     if (Srb->Cdb[1] & 0x01) {
-        IdeHandleInquiryVpd(Dev, Srb);
+        IdeHandleInquiryVpd(HwInit, Dev, Srb);
         return;
     }
     if (Srb->Cdb[2] != 0) {
@@ -416,8 +485,10 @@ IdeHandleInquiry(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
     }
 
     ZeroMemoryBytes(&inq, sizeof(inq));
-    inq.DeviceType = Dev->IsAtapi ? READ_ONLY_DIRECT_ACCESS_DEVICE : DIRECT_ACCESS_DEVICE;
-    inq.RemovableMedia = Dev->IsAtapi ? 1 : ((id[IDE_ID_CONFIG] & IDW0_REMOVABLE) ? 1 : 0);
+    inq.DeviceType = Dev->IsAtapi ? IdeAtapiDeviceType(Dev) : DIRECT_ACCESS_DEVICE;
+    /* ATAPI: word 0 bit 7, and every CD/DVD drive as before */
+    inq.RemovableMedia = (Dev->IsAtapi && inq.DeviceType == READ_ONLY_DIRECT_ACCESS_DEVICE) ? 1 :
+                         ((id[IDE_ID_CONFIG] & IDW0_REMOVABLE) ? 1 : 0);
     inq.Versions = Dev->IsAtapi ? 0 : IDE_INQUIRY_VERSION_SPC3;
     inq.ResponseDataFormat = 2;
     inq.AdditionalLength = 31;
@@ -456,20 +527,28 @@ IdeHandleReportLuns(IN PSCSI_REQUEST_BLOCK Srb)
     IdeGood(Srb);
 }
 
+/* READ CAPACITY(10) for 2 TB and more (last LBA FFFFFFFFh or beyond):
+   FFFFFFFFh sends a class driver that knows READ CAPACITY(16) there.
+   One that does not (NT 3.x/4.0, 9x, 2000, XP x86) adds one to it in 32
+   bits and sees a disk of 0 bytes; it gets FFFFFFFEh, the most it can
+   address with READ(10), and sees the first 2 TB. */
 static VOID
-IdeHandleReadCapacity10(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+IdeHandleReadCapacity10(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
     UCHAR data[8];
     IDE_LBA last = IdeLastLba(Dev);
 
-    IdePutBigEndian32(&data[0], (last.High != 0) ? 0xFFFFFFFF : last.Low);
+    if (last.High != 0 || last.Low == 0xFFFFFFFF) {
+        last.Low = HwInit->Capacity16 ? 0xFFFFFFFF : 0xFFFFFFFE;
+    }
+    IdePutBigEndian32(&data[0], last.Low);
     IdePutBigEndian32(&data[4], Dev->SectorSize);
     IdeCopyToSrb(Srb, data, sizeof(data));
     IdeGood(Srb);
 }
 
 static VOID
-IdeHandleReadCapacity16(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+IdeHandleReadCapacity16(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
     UCHAR data[IDE_READ_CAPACITY16_DATA_LEN];
     IDE_LBA last = IdeLastLba(Dev);
@@ -481,6 +560,9 @@ IdeHandleReadCapacity16(IN PIDE_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
     IdePutBigEndian32(&data[4], last.Low);
     IdePutBigEndian32(&data[8], Dev->SectorSize);
     data[13] = (UCHAR)(Dev->PhysExponent & 0x0F);
+    if (Dev->Trim && Dev->UseDma && HwInit->TrimAllowed) {
+        data[14] = (UCHAR)(0x80 | (Dev->TrimZeroes ? 0x40 : 0));        /* LBPME, LBPRZ */
+    }
 
     n = sizeof(data);
     if (n > allocLen) n = allocLen;
@@ -684,6 +766,59 @@ IdeFlushDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
                                   0, 0, IDE_POLL_TIMEOUT_POWER_SEC) == IDE_CMD_OK);
 }
 
+/* System shutdown: write cache flushed. With STANDBY=1 also STANDBY
+   IMMEDIATE, so the drive parks its heads (or an SSD saves its tables)
+   before the power goes; a request after it spins the drive up again. */
+VOID
+IdeShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
+{
+    PIDE_DEVICE dev = IDE_DEV(HwInit, Channel, Unit);
+
+    if (!dev->Present || dev->IsAtapi || !dev->IdentifyValid) return;
+    IdeFlushDevice(HwInit, Channel, Unit);
+    if (!HwInit->StandbyAtShutdown) return;
+    if (IdeRunSimple(HwInit, Channel, Unit, IDE_COMMAND_STANDBY_IMMEDIATE, 0, 0, IDE_POLL_TIMEOUT_POWER_SEC) == IDE_CMD_OK) {
+        IDE_DBG((IDE_PFX "Channel %lu.%lu: standby for shutdown\n", Channel, Unit));
+    }
+}
+
+/* DATA SET MANAGEMENT TRIM of Count sectors from Lba: one 512-byte block
+   of up to 64 ranges per command, through the channel's bounce buffer */
+static ULONG
+IdeTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, IN IDE_LBA Lba, IN ULONG Count)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PULONG range;
+    ATA_REQUEST req;
+    ULONG n, piece, result;
+
+    while (Count > 0) {
+        range = (PULONG)ch->BounceBuffer;
+        ZeroMemoryBytes(range, IDE_BOUNCE_SIZE);
+        for (n = 0; n < IDE_DSM_RANGES_PER_BLOCK && Count > 0; n++) {
+            piece = (Count > IDE_DSM_MAX_RANGE) ? IDE_DSM_MAX_RANGE : Count;
+            range[n * 2] = Lba.Low;
+            range[n * 2 + 1] = (Lba.High & 0xFFFF) | (piece << 16);
+            IdeLbaAdd(&Lba, piece);
+            Count -= piece;
+        }
+        ZeroMemoryBytes(&req, sizeof(req));
+        req.Unit = (UCHAR)Unit;
+        req.Command = IDE_COMMAND_DATA_SET_MANAGEMENT;
+        req.Features = IDE_DSM_TRIM;
+        req.Is48Bit = TRUE;
+        req.SectorCount = 1;
+        req.DataBuffer = ch->BounceBuffer;
+        req.DataBufferLen = IDE_BOUNCE_SIZE;
+        req.IsWrite = TRUE;
+        req.UseDma = TRUE;
+        req.TimeoutSec = IDE_POLL_TIMEOUT_POWER_SEC;
+        result = IdeRunCommand(HwInit, Channel, NULL, &req);
+        if (result != IDE_CMD_OK) return result;
+    }
+    return IDE_CMD_OK;
+}
+
 /* C/H/S for a device without LBA, packed as IdeWriteTaskFile wants it */
 static BOOLEAN
 IdeChsFromLba(IN PIDE_DEVICE Dev, IN IDE_LBA Lba, OUT PIDE_LBA Packed)
@@ -786,6 +921,162 @@ IdeRunReadWrite(
     return result;
 }
 
+/* TRIM mode: the write's data is the pattern, repeated from the first byte */
+static BOOLEAN
+IdeIsTrimPattern(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR Data, IN ULONG Length)
+{
+    ULONG i, j;
+
+    if (Data == NULL || Length < IDE_TRIM_PATTERN_SIZE) return FALSE;
+    for (i = 0; i < Length; i += IDE_TRIM_PATTERN_SIZE) {
+        for (j = 0; j < IDE_TRIM_PATTERN_SIZE && i + j < Length; j += 4) {
+            if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(&HwInit->TrimPattern[j])) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* UNMAP: the block descriptors become DATA SET MANAGEMENT TRIM ranges */
+static VOID
+IdeAtaUnmap(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    ULONG unit = IDE_UNIT_OF_TARGET(Srb->TargetId);
+    PIDE_DEVICE dev = IDE_DEV(HwInit, Channel, unit);
+    PUCHAR param = (PUCHAR)Srb->DataBuffer;
+    ULONG listLen = ((ULONG)Srb->Cdb[7] << 8) | Srb->Cdb[8], descLen, n, i, count, result;
+    IDE_LBA lba;
+
+    if (!dev->Trim || !dev->UseDma || !HwInit->TrimAllowed) {
+        IdeFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, IDE_ASC_INVALID_OPCODE, 0);
+        return;
+    }
+    if (listLen > Srb->DataTransferLength) listLen = Srb->DataTransferLength;
+    if (listLen == 0 || param == NULL) {
+        IdeGood(Srb);
+        return;
+    }
+    if (listLen < 8) {
+        IdeFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, IDE_ASC_PARAM_LIST_LENGTH, 0);
+        return;
+    }
+    descLen = ((ULONG)param[2] << 8) | param[3];
+    if (descLen > listLen - 8) descLen = listLen - 8;
+    n = descLen / 16;
+    if (n > IDE_UNMAP_MAX_DESCRIPTORS) {
+        IdeFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, IDE_ASC_INVALID_PARAM_FIELD, 0);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        lba = IdeLbaFromBigEndian(param + 8 + i * 16, 8);
+        count = IdeBigEndian32(param + 8 + i * 16 + 8);
+        if (count != 0 && (count > IDE_UNMAP_MAX_BLOCKS || !IdeLbaRangeValid(dev, lba, count))) {
+            IdeFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, IDE_ASC_LBA_OUT_OF_RANGE, 0);
+            return;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        lba = IdeLbaFromBigEndian(param + 8 + i * 16, 8);
+        count = IdeBigEndian32(param + 8 + i * 16 + 8);
+        if (count == 0) continue;
+        result = IdeTrim(HwInit, Channel, unit, lba, count);
+        if (result != IDE_CMD_OK) {
+            IdeCompleteResult(HwInit, Channel, Srb, result);
+            return;
+        }
+    }
+    IdeGood(Srb);
+}
+
+/* SMART: threshold state and temperature (attribute C2h, else BEh).
+   FALSE when the drive has no SMART or it failed. */
+static BOOLEAN
+IdeSmartHealth(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, OUT PBOOLEAN Exceeded,
+               OUT PUCHAR Temperature)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PIDE_DEVICE dev = &ch->Devices[Unit];
+    PUCHAR data = ch->BounceBuffer;
+    ATA_REQUEST req;
+    ULONG i;
+
+    *Exceeded = FALSE;
+    *Temperature = 0xFF;
+    if (!dev->Smart) return FALSE;
+
+    ZeroMemoryBytes(&req, sizeof(req));
+    req.Unit = (UCHAR)Unit;
+    req.Command = IDE_COMMAND_SMART;
+    req.Features = IDE_SMART_RETURN_STATUS_FEATURE;
+    req.Lba.Low = IDE_SMART_LBA_SIGNATURE;
+    if (IdeRunCommand(HwInit, Channel, NULL, &req) != IDE_CMD_OK) return FALSE;
+    *Exceeded = (BOOLEAN)(ch->Result.Lba1 == 0xF4 && ch->Result.Lba2 == 0x2C);
+
+    ZeroMemoryBytes(&req, sizeof(req));
+    ZeroMemoryBytes(data, IDE_BOUNCE_SIZE);
+    req.Unit = (UCHAR)Unit;
+    req.Command = IDE_COMMAND_SMART;
+    req.Features = IDE_SMART_READ_DATA_FEATURE;
+    req.SectorCount = 1;
+    req.Lba.Low = IDE_SMART_LBA_SIGNATURE;
+    req.UseBounce = TRUE;
+    req.DataBufferLen = IDE_BOUNCE_SIZE;
+    if (IdeRunCommand(HwInit, Channel, NULL, &req) == IDE_CMD_OK) {
+        for (i = 0; i < 30; i++) {
+            PUCHAR a = data + 2 + i * 12;
+            if (a[0] == 0xC2 || (a[0] == 0xBE && *Temperature == 0xFF)) *Temperature = a[5];
+        }
+    }
+    return TRUE;
+}
+
+/* LOG SENSE: supported pages, temperature, informational exceptions */
+static VOID
+IdeAtaLogSense(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    ULONG unit = IDE_UNIT_OF_TARGET(Srb->TargetId);
+    PIDE_DEVICE dev = IDE_DEV(HwInit, Channel, unit);
+    UCHAR pageCode = (UCHAR)(Srb->Cdb[2] & 0x3F), buf[20], temperature;
+    ULONG allocLen = ((ULONG)Srb->Cdb[7] << 8) | Srb->Cdb[8], len;
+    BOOLEAN exceeded;
+
+    ZeroMemoryBytes(buf, sizeof(buf));
+    buf[0] = pageCode;
+    switch (pageCode) {
+    case IDE_LOG_PAGE_SUPPORTED:
+        buf[4] = IDE_LOG_PAGE_SUPPORTED;
+        len = 5;
+        if (dev->Smart) buf[len++] = IDE_LOG_PAGE_TEMPERATURE;
+        buf[len++] = IDE_LOG_PAGE_INFO_EXCEPTIONS;
+        break;
+    case IDE_LOG_PAGE_TEMPERATURE:
+        if (!IdeSmartHealth(HwInit, Channel, unit, &exceeded, &temperature)) {
+            IdeInvalidField(dev, Srb);
+            return;
+        }
+        /* 0000h temperature, 0001h reference temperature (not known) */
+        buf[6] = 0x03; buf[7] = 2; buf[9] = temperature;
+        buf[11] = 0x01; buf[12] = 0x03; buf[13] = 2; buf[15] = 0xFF;
+        len = 16;
+        break;
+    case IDE_LOG_PAGE_INFO_EXCEPTIONS:
+        IdeSmartHealth(HwInit, Channel, unit, &exceeded, &temperature);
+        buf[6] = 0x03;
+        buf[7] = 3;
+        if (exceeded) buf[8] = IDE_ASC_FAILURE_PREDICTION;
+        buf[10] = temperature;
+        len = 11;
+        break;
+    default:
+        IdeInvalidField(dev, Srb);
+        return;
+    }
+    buf[2] = (UCHAR)((len - 4) >> 8);
+    buf[3] = (UCHAR)(len - 4);
+    if (len > allocLen) len = allocLen;
+    IdeCopyToSrb(Srb, buf, len);
+    IdeGood(Srb);
+}
+
 static VOID
 IdeAtaReadWrite(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -819,6 +1110,13 @@ IdeAtaReadWrite(
         return;
     }
     if (!IsWrite) Fua = FALSE;
+
+    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors */
+    if (IsWrite && HwInit->TrimMode && dev->Trim && dev->UseDma && HwInit->TrimAllowed &&
+        IdeIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
+        IdeCompleteResult(HwInit, Channel, Srb, IdeTrim(HwInit, Channel, unit, Lba, Count));
+        return;
+    }
 
     /* flushAfter: FUA wanted and not done by the command itself */
     flushAfter = Fua;
@@ -1079,7 +1377,7 @@ IdeProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQU
 
     switch (cdb[0]) {
     case SCSIOP_INQUIRY:
-        IdeHandleInquiry(dev, Srb);
+        IdeHandleInquiry(HwInit, dev, Srb);
         return;
 
     case SCSIOP_REQUEST_SENSE:
@@ -1106,12 +1404,12 @@ IdeProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQU
         return;
 
     case SCSIOP_READ_CAPACITY:
-        IdeHandleReadCapacity10(dev, Srb);
+        IdeHandleReadCapacity10(HwInit, dev, Srb);
         return;
 
     case IDE_SCSIOP_SERVICE_ACTION_IN16:
         if ((cdb[1] & 0x1F) == IDE_SA_READ_CAPACITY16) {
-            IdeHandleReadCapacity16(dev, Srb);
+            IdeHandleReadCapacity16(HwInit, dev, Srb);
             return;
         }
         break;
@@ -1170,6 +1468,14 @@ IdeProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQU
 
     case IDE_SCSIOP_VERIFY16:
         IdeAtaVerify(HwInit, Channel, Srb, IdeLbaFromBigEndian(&cdb[2], 8), IdeBigEndian32(&cdb[10]));
+        return;
+
+    case IDE_SCSIOP_UNMAP:
+        IdeAtaUnmap(HwInit, Channel, Srb);
+        return;
+
+    case IDE_SCSIOP_LOG_SENSE:
+        IdeAtaLogSense(HwInit, Channel, Srb);
         return;
     }
 
@@ -1276,37 +1582,42 @@ IdeAtapiModeSense6(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_RE
     PUCHAR bounce = HwInit->Channels[Channel].BounceBuffer;
     UCHAR cdb[12];
     UCHAR hdr6[4];
-    ULONG xferLen, i;
+    ULONG xferLen, total, blockDesc, i;
+
+    /* The same request with 4 more bytes for the longer header; DBD, page
+       control and page code as given */
+    xferLen = (ULONG)Srb->Cdb[4] + 4;
+    if (xferLen < 8) xferLen = 8;               /* at least the whole header */
+    if (xferLen > IDE_BOUNCE_SIZE) xferLen = IDE_BOUNCE_SIZE;
+    xferLen = (xferLen + 1) & ~1UL;             /* PRD byte counts are even */
 
     ZeroMemoryBytes(cdb, sizeof(cdb));
     cdb[0] = SCSIOP_MODE_SENSE10;
-    cdb[2] = (UCHAR)(Srb->Cdb[2] & 0x3F);
-    cdb[7] = 0;
-    cdb[8] = Srb->Cdb[4];
-
-    xferLen = Srb->DataTransferLength;
-    if (xferLen > IDE_BOUNCE_SIZE) xferLen = IDE_BOUNCE_SIZE;
-    xferLen = (xferLen + 1) & ~1UL;
+    cdb[1] = (UCHAR)(Srb->Cdb[1] & 0x08);
+    cdb[2] = Srb->Cdb[2];
+    cdb[7] = (UCHAR)(xferLen >> 8);
+    cdb[8] = (UCHAR)xferLen;
 
     if (IdeAtapiBounceCommand(HwInit, Channel, unit, cdb, xferLen) != IDE_CMD_OK) {
         IdeAtapiFailed(HwInit, Channel, Srb);
         return;
     }
 
-    if (Srb->DataTransferLength >= sizeof(MODE_PARAMETER_HEADER_10)) {
-        ULONG payload = Srb->DataTransferLength - sizeof(MODE_PARAMETER_HEADER_10);
-        if (payload > IDE_BOUNCE_SIZE - sizeof(MODE_PARAMETER_HEADER_10)) {
-            payload = IDE_BOUNCE_SIZE - sizeof(MODE_PARAMETER_HEADER_10);
-        }
-        hdr6[0] = bounce[1];
-        hdr6[1] = bounce[2];
-        hdr6[2] = 0;
-        hdr6[3] = 0;
-        for (i = 0; i < payload; i++) bounce[4 + i] = bounce[8 + i];
-        for (i = 0; i < 4; i++) bounce[i] = hdr6[i];
-    }
+    /* Header (10) to header (6): data length less 3, medium type, device
+       specific parameter (write protect of a removable disk), block
+       descriptor length; the descriptors and pages follow unchanged */
+    total = (((ULONG)bounce[0] << 8) | bounce[1]) + 2;     /* all the drive has */
+    if (total < 8) total = 8;
+    blockDesc = ((ULONG)bounce[6] << 8) | bounce[7];
+    hdr6[0] = (UCHAR)((total - 5 > 255) ? 255 : total - 5);
+    if (total > xferLen) total = xferLen;                   /* what came back */
+    hdr6[1] = bounce[2];
+    hdr6[2] = bounce[3];
+    hdr6[3] = (UCHAR)((blockDesc > 255) ? 255 : blockDesc);
+    for (i = 8; i < total; i++) bounce[i - 4] = bounce[i];
+    for (i = 0; i < 4; i++) bounce[i] = hdr6[i];
 
-    IdeCopyToSrb(Srb, bounce, Srb->DataTransferLength);
+    IdeCopyToSrb(Srb, bounce, total - 4);
     IdeGood(Srb);
 }
 
@@ -1329,9 +1640,29 @@ IdeProcessAtapiSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_RE
     ULONG result;
     UCHAR status;
 
+    /* ATAPI has no READ(6)/WRITE(6) (MMC, SFF-8070i): the same transfer as
+       READ(10)/WRITE(10), for a class driver of a removable disk that
+       sends the short form */
+    if (Srb->Cdb[0] == SCSIOP_READ6 || Srb->Cdb[0] == SCSIOP_WRITE6) {
+        PUCHAR c = Srb->Cdb;
+        ULONG lba = ((ULONG)(c[1] & 0x1F) << 16) | ((ULONG)c[2] << 8) | c[3];
+        ULONG count = (c[4] != 0) ? c[4] : 256;
+        UCHAR op = (UCHAR)((c[0] == SCSIOP_READ6) ? SCSIOP_READ : SCSIOP_WRITE);
+
+        ZeroMemoryBytes(c, 10);
+        c[0] = op;
+        c[2] = (UCHAR)(lba >> 24);
+        c[3] = (UCHAR)(lba >> 16);
+        c[4] = (UCHAR)(lba >> 8);
+        c[5] = (UCHAR)lba;
+        c[7] = (UCHAR)(count >> 8);
+        c[8] = (UCHAR)count;
+        Srb->CdbLength = 10;
+    }
+
     switch (Srb->Cdb[0]) {
     case SCSIOP_INQUIRY:
-        IdeHandleInquiry(dev, Srb);
+        IdeHandleInquiry(HwInit, dev, Srb);
         return;
 
     case SCSIOP_REQUEST_SENSE:
@@ -1622,7 +1953,7 @@ IdeFillInfo(IN PHW_DEVICE_EXTENSION HwInit, OUT PIDE_IOCTL_INFO Info)
     ZeroMemoryBytes(Info, sizeof(IDE_IOCTL_INFO));
     Info->Version = IDE_DRIVER_VERSION;
     Info->Flags = (HwInit->AsyncMode ? IDE_INFO_ASYNC : 0) |
-                  (HwInit->Stopped ? IDE_INFO_POWERED_DOWN : 0);
+                  (HwInit->Stopped ? IDE_INFO_POWERED_DOWN : 0) | (HwInit->TrimMode ? IDE_INFO_TRIM_MODE : 0);
     Info->ChannelCount = HwInit->ChannelCount;
     Info->PciVendorDevice = HwInit->HasPci ? (((ULONG)HwInit->DeviceId << 16) | HwInit->VendorId) : 0;
     Info->InterruptCount = HwInit->InterruptCount;
@@ -1696,6 +2027,17 @@ IdeProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
             break;
         case IDE_IOCTL_POWER_UP:
             if (HwInit->Stopped) IdeReinitialize(HwInit);
+            break;
+        case IDE_IOCTL_TRIM_MODE_ON:
+            if (available < IDE_TRIM_PATTERN_SIZE || !HwInit->TrimAllowed) {
+                ctl->ReturnCode = 1;
+                break;
+            }
+            CopyMemoryBytes(HwInit->TrimPattern, (PUCHAR)ctl + ctl->HeaderLength, IDE_TRIM_PATTERN_SIZE);
+            HwInit->TrimMode = TRUE;
+            break;
+        case IDE_IOCTL_TRIM_MODE_OFF:
+            HwInit->TrimMode = FALSE;
             break;
         default:
             Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;

@@ -13,7 +13,7 @@ Signature="$CHICAGO"
 Class=hdc
 ClassGUID={4D36E96A-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=10/08/2026,1.0.0.0
+DriverVer=10/19/2026,1.1.0.0
 
 [DestinationDirs]
 DefaultDestDir = 12

@@ -1,0 +1,51 @@
+//
+// ident.rc - version resource of ident.sys / ident9x.mpd
+//
+
+#include <winver.h>
+
+#define IDE_VER_NUM              1,1,0,0
+#define IDE_VER_STR              "1.1.0.0"
+
+#ifdef IDE_W9X
+#define IDE_FILE_STR             "ident9x.mpd"
+#define IDE_DESCRIPTION_STR      "ident9x PATA/SATA IDE Storage Controller Miniport Driver"
+#define IDE_FILEOS               VOS_DOS_WINDOWS32
+#else
+#define IDE_FILE_STR             "ident.sys"
+#define IDE_DESCRIPTION_STR      "ident PATA/SATA IDE Storage Controller Miniport Driver"
+#define IDE_FILEOS               VOS_NT_WINDOWS32
+#endif
+
+#ifdef RC_INVOKED
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     IDE_VER_NUM
+PRODUCTVERSION  IDE_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          IDE_FILEOS
+FILETYPE        VFT_DRV
+FILESUBTYPE     VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "ages2001"
+            VALUE "FileDescription",  IDE_DESCRIPTION_STR
+            VALUE "FileVersion",      IDE_VER_STR
+            VALUE "InternalName",     IDE_FILE_STR
+            VALUE "LegalCopyright",   "Copyright (C) 2026 ages2001"
+            VALUE "OriginalFilename", IDE_FILE_STR
+            VALUE "ProductName",      "IDENT"
+            VALUE "ProductVersion",   IDE_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+#endif

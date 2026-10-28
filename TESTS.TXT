@@ -1,4 +1,52 @@
-IDENT - test results for this release (QEMU 8.2: PIIX3, CMD646, SiI3112)
+IDENT - test results (QEMU 8.2: PIIX3, CMD646, SiI3112); 1.1.0.0: see
+"Several controllers in one machine" below
+
+Additions to 1.1.0.0 (2026-10-26): OFF=, MPS interrupt check, disks of
+2 TB and more, 32 controllers
+
+- ATAPI device type (reported: a ZIP 100 IDE drive came up as a
+  CD-ROM). QEMU has no ATAPI disk, so its ide-cd was patched for the
+  test to report peripheral device type 0 (removable direct access) in
+  IDENTIFY PACKET DEVICE, with an image whose 2048-byte blocks carry
+  their LBA. atptest (SCSI pass-through on the PhysicalDrive):
+  INQUIRY type 0 / RMB 1, READ CAPACITY 32767 x 2048, MODE SENSE(6)
+  page 01h with a 4-byte header (length 0Bh, page follows), header
+  only (4 bytes) with the full length, READ(10) and READ(6) of LBA 3
+  equal, drive geometry RemovableMedia, removable drive letter:
+  NT 3.1 (IDENT on the primary master, AHCINT on an AHCI port, the
+  same run), Windows 2000 (both), Windows 95 (IDENT9X and AHCINT9X:
+  removable drive letters). All passed.
+  CD/DVD drives (device type 5) unchanged: still CD-ROM drives with
+  their files listed on NT 3.1 and Windows 2000. Not tested: writes to a
+  removable ATAPI disk (QEMU's ATAPI device has no write command) and
+  a real ZIP drive.
+- OFF=: a whole channel and a single device turned off on NT 3.1 (the
+  channel gets no adapter and its ports stay free; the other device of a
+  channel keeps working) and on Windows 2000.
+- Disks of 2 TB and more (3 TB image on the PIIX3): Windows 2000 sees 2 TB
+  minus one sector (2097149 MB) instead of 0 bytes.
+- The MPS interrupt check runs in the legacy pass on NT 3.50-4.0; with
+  interrupts translated normally (UP HAL, MPS HAL with MP table entries)
+  nothing changes.
+- Release build on XP x64 (GUI-mode setup) next to AHCINT, NVMENT and
+  MMCSDNT: CD-ROM and disk listed, shutdown powered off.
+- IDENT9X: Windows 95 boots and lists its drives as before.
+- Device Manager page (identpp.dll, Channels tab), Windows 2000, x86
+  build: both channels with their ports and the slave disk on the
+  primary channel. Turning the slave off through the page's test entry
+  wrote OFF=0.1.1:0.1; after the restart the disk was gone, and the page
+  still listed both channels (with no device left, ScsiPort did not
+  pass the info request on; the page then assumes two channels).
+- XP x64 GUI-mode setup: ident.inf (F6 copy) installed the x64 DLL into
+  System32; the page listed the disk (primary master) and the DVD drive
+  (secondary master).
+- The page DLLs were built with MinGW-w64 (tools\mkpp.sh); the x86 and
+  x64 builds import only functions Windows 2000 exports (checked against
+  its DLLs). Text-mode setup rejected a first build listed in
+  txtsetup.oem ("not a valid Windows system image"): its PE checksum was
+  stale after the header was edited. mkpp.sh now writes the checksum.
+  Not tested: the F6 path on Windows 2000 (only XP x64), Have Disk with
+  the main INF (the F6 copies differ only in their source paths).
 
 bin\NT\ident.sys was built from these sources with i686 MinGW (GCC 13)
 against import libraries generated from NT 3.1's own SCSIPORT.SYS and
@@ -28,6 +76,8 @@ QEMU used for the tests
     ports as the PIIX3; with CMD646_BARS=e000 those writes are moved to
     E000h/E010h/E020h/E030h, as a BIOS that assigns free I/O space would
     do. Bus master (BAR 4) as SeaBIOS assigned it.
+    CMD646_BARMASK=<hex>: only the BARs whose bit is set are moved
+    (1 = BAR 0 ... 8 = BAR 3), the others stay on the legacy ports.
   - CMD646_STICKY=1: the CMD646 interrupt latches stay set until
     software writes 1 to them (CFR/ARTTIM23 in config space, MRDMODE
     bits 2/3 at bus master base + 1), and the PCI interrupt follows the
@@ -167,6 +217,33 @@ Windows 95 (RTM, x86)
   channel was lost on 9x) and read garbage from BusInterruptLevel2
   (not in SCSIPORT.PDR's PORT_CONFIGURATION_INFORMATION): both fixed
   (whole function per node, level2 = FALSE under IDE_W9X).
+
+TRIM, VPD, LOG SENSE, shutdown standby, version resource
+- Windows 2000 SP4, data disk on the PIIX3 primary channel with QEMU
+  discard=unmap, discard_granularity=512, rotation_rate=1 (an SSD for
+  IDENTIFY: word 169 TRIM, word 217 = 1), UDMA. Feature test (featst,
+  SCSI pass-through and miniport IOCTLs): READ CAPACITY(16) LBPME 1,
+  VPD 00h lists 80h B0h B1h B2h, B0h (max unmap 3FFFC0h, 64
+  descriptors), B1h rotation 1, B2h LBPU, LOG SENSE 00h (00 0D 2F),
+  0Dh (temperature from SMART), 2Fh, UNMAP of 16 blocks (DATA SET
+  MANAGEMENT by DMA; the blocks read back as zeros), UNMAP beyond the
+  end (ILLEGAL REQUEST 21h), TRIM mode (ordinary write written, pattern
+  write trimmed, pattern written again after TRIM_MODE_OFF): RESULT OK
+  fails=0.
+- System shutdown: "Channel 0.0: standby for shutdown" for the data disk
+  with a FAT volume (SRB_FUNCTION_SHUTDOWN reaches the driver since it
+  declares CachesData; the disk class sends it for disks with volumes).
+- trimnt on a 256 MB FAT volume on that disk (the image with 55 MB of
+  stale blocks): "Scsi4: IDENT TRIM mode on", the free space trimmed,
+  files deleted; the image went from 63.7 MB to 12.6 MB allocated,
+  sumtool FILES 5 ERRORS 0, CHKDSK clean.
+- Release build (bin\ as shipped): Windows 2000 next to AHCINT, MMCSDNT
+  and NVMENT data disks, featst RESULT OK fails=0, trimnt, sumtool and
+  CHKDSK OK; NT 4.0 booting through IDENT (system disk on the PIIX3,
+  trimnt switched IDENT's TRIM mode on for it as well); Windows 95
+  booting through IDENT9X (sumtool and w95io on the other disks OK).
+- File properties of every binary show version 1.0.0.0
+  (OriginalFilename ident.sys / ident9x.mpd).
 
 Final binaries
 - bin\2KXP\i386\ident.sys and amd64\ident.sys rebuilt with the
@@ -391,6 +468,137 @@ Memory above 4 GB
   PAE kernel (hmtest 300 rounds, hiio, idetest, bench, chkdsk all OK).
   Memory above 4 GB under Windows 2000 needs Advanced Server or
   Datacenter, not tested.
+
+Several controllers in one machine (1.1.0.0)
+QEMU's SeaBIOS writes 1F0h/3F4h/170h/374h into BAR 0-3 of every native
+IDE function other than the PIIX3. The runs below leave them there (no
+CMD646_BARS), or with CMD646_BARMASK leave one pair there and move the
+other. QEMU then decodes the legacy ports for the CMD646, not for the
+PIIX3: the situation of a machine booted from a native-mode controller
+whose compatibility-mode drives are missing.
+- Before (1.0.0.0 logic, debug build): NT 4.0 booted from the CMD646
+  primary, k512 on the PIIX3 primary, CD + data1 on the PIIX3
+  secondary: the PIIX3 channel at 1F0 reported 1 device (the CMD646's
+  system disk), the one at 170 none, DMA errors and PIO for the system
+  disk (the PIIX3's bus master moved its data), and the CMD646 itself
+  was skipped as its ports were already taken: k512, the CD and data1
+  missing. Windows 2000 (system on AHCI, k1024 on the CMD646, the same
+  PIIX3 drives): both adapters at 1F0, IDENTIFY failures and resets
+  in a loop.
+- NT 4.0, the same machine: "Ports: bus 0 slot 0000000C native channels
+  moved from 1F0 to C400" (an earlier build that searched both
+  directions at once chose BCE0h); PIIX3 channel 0 k512, channel 1 CD
+  and data1, CMD646 at C400h/C410h, interrupt-driven on IRQ 11. NT 4.0
+  found its boot disk by signature, but without drive letters saved by
+  Disk Administrator k512's volume became C: and the test batch at
+  C:\test was not found; with DriverParameters NATIVEFIRST=1 the system
+  partition is C: again. Release build with NATIVEFIRST=1: drvlist
+  PhysicalDrive0 399 MB (system, CMD646), 1 = k512, 2 = data1, the CD
+  as F:; idetest RESULT OK fails=0 on all three (modes 22, 12, 92/12;
+  2139 interrupts on the CMD646), bench RESULT OK errors=0 on C:, D:
+  and E: (50 MB). NT 4.0's ScsiPort takes the value name
+  DriverParameters as well as DriverParameter.
+- NT 3.1, the same disks (system on the CMD646 primary, data1 on the
+  PIIX3 primary, CD + data2 on the PIIX3 secondary): "native channels
+  moved from 1F0 to C400"; PIIX3 1F0 1 device, 170 2 devices, CMD646
+  at C400 (Fast Polling, as documented for a native function on NT 3.1)
+  1 device. NT 3.1 numbered data1 first and did not come up (autochk,
+  then nothing; rdisk(0) is not the system disk). With DriverParameter
+  NATIVEFIRST=1 (set with regtool from the system booted from the
+  PIIX3): the CMD646 channels became the first adapters, the system
+  booted, drvlist: PhysicalDrive0 399 MB (system), 1 = data1, 2 = data2.
+- Windows 2000 (system on AHCI, k512 on the PIIX3 primary, CD + data1
+  on the PIIX3 secondary, k1024 on the CMD646 at 1F0/170, k4096 on the
+  SiI3112): "PnP requirements: bus 0 slot 0000000C, 8 port range(s)
+  kept off the legacy ports"; the PIIX3 started first: "bus 0 slot
+  0000000C (native mode on the legacy ports) quiet until its start",
+  IRQ 14 connected, channel 0 1 device, channel 1 2 devices; then the
+  CMD646 started at FFF8h (assigned by the PnP manager), 1 device. With
+  the first fix only (no quieting) the PIIX3 started while the CMD646
+  still decoded 170h and found nothing there.
+- XP x64, F6 installation from floppy onto the CMD646 primary (BAR 0/1
+  at E000h), the CMD646 secondary left at 170h/374h (CMD646_BARMASK=3),
+  the setup CD on the PIIX3 primary, data1 and k512 on the PIIX3
+  secondary, a disk on the SiI3112: the partition screen lists data1,
+  k512, the empty CMD646 disk and the SiI3112 disk; the CMD646's
+  requirements kept off the legacy ports (6 ranges), PIIX3 channel 1
+  "2 device(s)" in text mode and at the first boot of the installed
+  system from the CMD646 disk; GUI-mode setup reached Regional Options.
+- Windows 95, IDENT9X, system on the PIIX3 secondary master, the CD as
+  slave, data1 on the PIIX3 primary, w512 on the CMD646 primary left at
+  1F0h/3F4h (CMD646_BARMASK=c). As 1.0.0.0, the release build leaves
+  the CMD646 where it is on 9x. A trial build that moved it there too
+  ("moved from 1F0 to C400", after reading the other functions through
+  CF8h/CFCh: the 9x ScsiPortGetBusData reads only the device node's own
+  function) found data1 on the PIIX3 primary, but Windows 95 kept the
+  CMD646's device node unstarted (its boot configuration conflicts with
+  the PIIX3's), and the two BIOS drives for w512 at 1F0h then read
+  data1: geom showed D:, E: and F: with data1's volume. Hence no move
+  on 9x (see the README). Without the conflict (CMD646_BARMASK=f): the
+  CMD646 found as new hardware, installed from C:\IDENT, "FindAdapter:
+  2 channel(s) at E000", w512 found; on the PIIX3 data1, the system disk
+  and the CD slave.
+- Without a conflict (CMD646_BARS=e000, every earlier run in this file)
+  nothing is moved: no "Ports:" line on NT 4.0; on 2000/XP
+  the requirements are limited to 1000h and above, which the BIOS
+  addresses already meet.
+- ATAPI slave behind a hard disk: NT 4.0, PIIX3 secondary with data1 as
+  master and the CD as slave: before, "Channel 0: 1 device(s)" (probing
+  the master overwrote the slave's 14h/EBh signature, as every register
+  write reaches both devices); now "Channel 0.1: ATAPI, 12-byte
+  packets", 2 devices. Windows 95 the same (system disk master, CD
+  slave on the PIIX3 secondary): "Channel 1.1: ATAPI", 2 devices.
+- File properties of every binary show version 1.1.0.0 (ident.sys x86
+  and x64, ident9x.mpd). The NT build imports nothing NT 3.1 lacks
+  (checked against NT 3.1's own exports); the 2000/XP builds also
+  import HalGetBusDataByOffset and HalSetBusDataByOffset, exported by
+  the Windows 2000 and XP x64 HALs.
+
+CD-ROM drives on NT 3.1, drive positions, shutdown (1.1.0.0 update)
+Reported: on a VIA P4M800Pro-M board (VT8237 south bridge), the CD-ROM
+drive on the primary master was missing in NT 3.1's File Manager.
+- NT 3.1, system disk on AHCI, debug build, drive letters and CD-ROM
+  root listing read with a new tool (drvlet): every layout found the
+  drives and the CD-ROM was readable (7 entries in its root):
+  CD primary master + data1 slave + data2 secondary master; CD alone
+  on the primary master; data1 master + CD slave on the primary, a
+  second CD master + data2 slave on the secondary (CdRom0 and CdRom1);
+  CMD646 in native mode with a CD as primary master and one as
+  secondary slave (both CdRom0/CdRom1, Fast Polling).
+- The CD-ROM class driver scsicdrm set to Start 4 (as NT 3.1 leaves it
+  without a SCSI adapter: NT 3.1 has no IDE CD-ROM support): no
+  \Device\CdRom0 and no drive letter, the behaviour reported. Now the
+  driver, having found an ATAPI device, sets it to 1 at boot ("scsicdrm,
+  Start 4 -> 1"); the CD-ROM got its drive letter in the same boot and
+  the next. With scsicdrm, cdfs and cdfs_rec all at 4: "scsicdrm, Start
+  4 -> 1", "cdfs, Start 4 -> 1", CD readable; cdfs_rec left at 4.
+- scsicdrm at 4, cdfs at 4 but cdfs_rec at 1 (the recognizer loads
+  CDFS): only scsicdrm set to 1, cdfs left at 4, the CD readable.
+- A side effect of the oemsetup.inf run below: it gives the IDENT key
+  Tag 40, so IDENT loaded ahead of AHCINT and a data disk on the PIIX3
+  became rdisk(0): autochk, then the boot stopped (the NT 3.1 disk
+  numbering case described in the README). Tag removed for the runs
+  that followed.
+- oemsetup.inf on NT 3.1 (run through setup.exe -f -i with a wrapper
+  INF calling InstallOption), no CD-ROM drive attached so the driver
+  changed nothing: scsicdrm and cdfs 4 -> 1, cdfs_rec (4) left alone,
+  InstallOption returned STATUS_SUCCESSFUL.
+- Detection changes: a unit with status 0 and no signature whose
+  registers answer is tried as a packet device (IDENTIFY PACKET, then
+  IDENTIFY DEVICE) instead of being skipped; a slave identical to the
+  master in model and serial number is ignored. Every run above found
+  the same devices as before. On XP x64 an absent slave behind the
+  PIIX3's disk and behind its CD reads its registers back through the
+  master, and now gets the two IDENTIFY commands: "Channel 0.1: no
+  answer (status 00)", no reset, nothing found there, as before.
+- Standby at shutdown off by default (STANDBY=1 to turn it on), as in
+  AHCINT 1.6.0.0: XP x64, all four drivers, debug builds, shutdown
+  through NtShutdownSystem: powered off after 10 s, no IDENT standby
+  line; with DriverParameters STANDBY=1 "Channel 0.0: standby for
+  shutdown", powered off after 10 s.
+- XP x64, debug build of this state (detection changes
+  included): PIIX3 disk and CD found as before, Regional Options
+  reached, powered off after 10 s.
 
 Firmware and loader limits seen (not driver issues)
 - A BIOS-visible disk with 1024/4096-byte logical sectors: SeaBIOS

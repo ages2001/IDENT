@@ -8,3 +8,4 @@
 -map:ident9x.map
 -export:DriverEntry
 idemain.obj idecmd.obj idesatl.obj C:\DDK\BLOCK\LIB\scsiport.lib
+ident9x.res

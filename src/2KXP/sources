@@ -19,4 +19,5 @@ BUFFER_OVERFLOW_CHECKS=0
 SOURCES=..\idemain.c \
         ..\idecmd.c \
         ..\idesatl.c \
-        ..\idepnp.c
+        ..\idepnp.c \
+        ..\ident.rc

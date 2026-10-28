@@ -24,6 +24,9 @@ SCSI_ADAPTER_CONTROL_STATUS IdeAdapterControl(IN PVOID DeviceExtension,
 /* Crash dump / hibernation copy of the driver (DriverEntry without a
    driver object): polled, no registry access. */
 static BOOLEAN g_IdeDumpMode;
+/* The disk class driver reads READ CAPACITY(16) when READ CAPACITY(10)
+   reports FFFFFFFFh: Server 2003 SP1 and later, XP x64 */
+static BOOLEAN g_IdeCapacity16;
 
 /* ------------------------------------------------------------------ */
 /* Windows 9x: VMM services                                            */
@@ -140,15 +143,14 @@ IdeClaimPort(IN USHORT CmdPort)
 #define IDE_PCI_HEADER_LENGTH           64
 #define IDE_PCI_MULTIFUNCTION           0x80
 
-#ifdef IDE_NT31_COMPAT
-/* Configuration mechanism #1 through the I/O ports, for a HAL without PCI
-   support (NT 3.1). */
+#if defined(IDE_NT31_COMPAT) || defined(IDE_W9X)
+/* Configuration mechanism #1 through the I/O ports: for a HAL without PCI
+   support (NT 3.1), and on 9x for functions other than the device node's
+   own (SCSIPORT.PDR reads only that one) */
+#define IDE_PCI_PORTS
 #define IDE_PCI_CONFIG_ADDRESS          0xCF8
 #define IDE_PCI_CONFIG_DATA             0xCFC
 #define IDE_PCI_CONFIG_ENABLE           0x80000000UL
-
-static BOOLEAN g_IdePciProbed;
-static BOOLEAN g_IdePciViaPorts;
 
 static VOID
 IdePciSelect(IN ULONG Bus, IN ULONG Slot, IN ULONG Offset)
@@ -183,6 +185,26 @@ IdePciReadPortHeader(IN ULONG Bus, IN ULONG Slot, OUT PPCI_COMMON_CONFIG PciConf
     }
     return TRUE;
 }
+
+#ifdef IDE_NT31_COMPAT
+static VOID
+IdePciWritePort(IN ULONG Bus, IN ULONG Slot, IN ULONG Offset, IN ULONG Width, IN ULONG Value)
+{
+    IdePciSelect(Bus, Slot, Offset & ~3UL);
+    if (Width == 1) {
+        IDE_OUTB(IDE_PCI_CONFIG_DATA + (Offset & 3), Value);
+    } else if (Width == 2) {
+        IDE_OUTW(IDE_PCI_CONFIG_DATA + (Offset & 2), Value);
+    } else {
+        IDE_OUTD(IDE_PCI_CONFIG_DATA, Value);
+    }
+}
+#endif
+#endif /* IDE_PCI_PORTS */
+
+#ifdef IDE_NT31_COMPAT
+static BOOLEAN g_IdePciProbed;
+static BOOLEAN g_IdePciViaPorts;
 
 static VOID
 IdePciProbeAccess(IN PHW_DEVICE_EXTENSION HwInit)
@@ -229,25 +251,25 @@ IdePciReadConfig(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Offset, IN ULONG Width
     return value;
 }
 
+static VOID
+IdePciWriteConfigAt(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Bus, IN ULONG Slot,
+                    IN ULONG Offset, IN ULONG Width, IN ULONG Value)
+{
+#ifdef IDE_NT31_COMPAT
+    /* No ScsiPortSetBusDataByOffset to import on NT 3.1: configuration
+       mechanism #1 through the ports, as the HAL does on x86 */
+    (VOID)HwInit;
+    IdePciWritePort(Bus, Slot, Offset, Width, Value);
+#else
+    ScsiPortSetBusDataByOffset(HwInit, PCIConfiguration, Bus, Slot, &Value, Offset, Width);
+#endif
+}
+
 VOID
 IdePciWriteConfig(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Offset, IN ULONG Width, IN ULONG Value)
 {
     if (!HwInit->HasPci) return;
-#ifdef IDE_NT31_COMPAT
-    /* No ScsiPortSetBusDataByOffset to import on NT 3.1: configuration
-       mechanism #1 through the ports, as the HAL does on x86 */
-    IdePciSelect(HwInit->PciBus, HwInit->PciSlot, Offset & ~3UL);
-    if (Width == 1) {
-        IDE_OUTB(IDE_PCI_CONFIG_DATA + (Offset & 3), Value);
-    } else if (Width == 2) {
-        IDE_OUTW(IDE_PCI_CONFIG_DATA + (Offset & 2), Value);
-    } else {
-        IDE_OUTD(IDE_PCI_CONFIG_DATA, Value);
-    }
-#else
-    ScsiPortSetBusDataByOffset(HwInit, PCIConfiguration, HwInit->PciBus, HwInit->PciSlot,
-                               &Value, Offset, Width);
-#endif
+    IdePciWriteConfigAt(HwInit, HwInit->PciBus, HwInit->PciSlot, Offset, Width, Value);
 }
 
 static BOOLEAN
@@ -268,6 +290,12 @@ IdeReadPciHeader(
     }
 #endif
     bytesRead = ScsiPortGetBusData(HwInit, PCIConfiguration, Bus, Slot, PciConfig, IDE_PCI_HEADER_LENGTH);
+#ifdef IDE_W9X
+    if (bytesRead < IDE_PCI_HEADER_LENGTH) {
+        if (BusMissing != NULL) *BusMissing = FALSE;
+        return IdePciReadPortHeader(Bus, Slot, PciConfig);
+    }
+#endif
     if (BusMissing != NULL) *BusMissing = (BOOLEAN)(bytesRead == 0);
     if (bytesRead < IDE_PCI_HEADER_LENGTH) return FALSE;
     if (PciConfig->VendorID == 0xFFFF || PciConfig->VendorID == 0x0000) return FALSE;
@@ -600,10 +628,12 @@ IdeDescribePciChannels(IN PPCI_COMMON_CONFIG PciConfig, OUT PIDE_CHANNEL_DESC De
     return n;
 }
 
-/* Walk the PCI buses for the next IDE function with an unclaimed channel */
+/* Walk the PCI buses for the next IDE function with an unclaimed channel
+   (with NativeOnly: an unclaimed channel in native mode) */
 static BOOLEAN
 IdeScanPci(
     IN PHW_DEVICE_EXTENSION HwInit,
+    IN BOOLEAN NativeOnly,
     OUT PULONG FoundBus,
     OUT PULONG FoundSlot,
     OUT PPCI_COMMON_CONFIG PciConfig
@@ -635,7 +665,7 @@ IdeScanPci(
 
                 n = IdeDescribePciChannels(PciConfig, desc);
                 for (i = 0; i < n; i++) {
-                    if (!IdeIsPortClaimed(desc[i].CmdPort)) {
+                    if (!IdeIsPortClaimed(desc[i].CmdPort) && (!NativeOnly || desc[i].Native)) {
                         *FoundBus = bus;
                         *FoundSlot = slot.u.AsULONG;
                         return TRUE;
@@ -717,6 +747,317 @@ IdeLegacyChannelPresent(IN USHORT CmdPort, IN USHORT CtlPort)
     c = IDE_INB(CmdPort + IDE_REG_LBA0);
     return (BOOLEAN)(c == 0xAA);
 }
+
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+/* ------------------------------------------------------------------ */
+/* Native-mode channels on another controller's ports                  */
+/* ------------------------------------------------------------------ */
+
+/* A BIOS may leave the BARs 0-3 of a native-mode function at the legacy
+   addresses (SeaBIOS writes 1F0h/3F4h/170h/374h into every native IDE
+   function other than the PIIX), where a compatibility-mode function
+   decodes as well: both answer, and the devices of one controller hide
+   those of the other. Before any channel is taken, such a function is
+   moved to free I/O space next to its bus master block, inside the
+   window of its bridge. 2000/XP get the same through the PnP resource
+   requirements (idepnp.c). Not on 9x: drives without a protected-mode
+   driver stay on INT 13h, and the BIOS reaches them at the addresses
+   it set. */
+
+#define IDE_IO_USED_MAX                 160
+#define IDE_IO_BRIDGES_MAX              16
+#define IDE_IO_FUNCTIONS_MAX            IDE_MAX_CONTROLLERS
+#define IDE_IO_BLOCK                    32      /* cmd 8 + ctl 4 per channel, two channels */
+#define IDE_IO_FLOOR                    0x1000
+#define IDE_IO_SEARCH_STEPS             2048
+
+typedef struct _IDE_IO_RANGE {
+    ULONG Start;
+    ULONG End;                                  /* inclusive */
+} IDE_IO_RANGE;
+
+typedef struct _IDE_IO_BRIDGE {
+    UCHAR   Primary;
+    UCHAR   Secondary;
+    BOOLEAN WindowOn;
+    ULONG   Base;
+    ULONG   Limit;
+} IDE_IO_BRIDGE;
+
+typedef struct _IDE_IO_FUNCTION {
+    ULONG Bus;
+    ULONG Slot;
+    ULONG Bar[5];
+    UCHAR ProgIf;
+    UCHAR SubClass;
+} IDE_IO_FUNCTION;
+
+typedef struct _IDE_IO_MAP {
+    IDE_IO_RANGE    Used[IDE_IO_USED_MAX];
+    ULONG           UsedCount;
+    IDE_IO_BRIDGE   Bridge[IDE_IO_BRIDGES_MAX];
+    ULONG           BridgeCount;
+    IDE_IO_FUNCTION Ide[IDE_IO_FUNCTIONS_MAX];
+    ULONG           IdeCount;
+    BOOLEAN         Overflow;                   /* a table ran full: move nothing */
+} IDE_IO_MAP;
+
+static IDE_IO_MAP g_IdeIoMap;
+static BOOLEAN g_IdeIoChecked;
+
+static VOID
+IdeIoAddUsed(IN ULONG Start, IN ULONG End)
+{
+    IDE_IO_MAP *m = &g_IdeIoMap;
+    if (Start == 0 || End < Start) return;
+    if (m->UsedCount >= IDE_IO_USED_MAX) {
+        m->Overflow = TRUE;
+        return;
+    }
+    m->Used[m->UsedCount].Start = Start;
+    m->Used[m->UsedCount].End = End;
+    m->UsedCount++;
+}
+
+static BOOLEAN
+IdeIoOverlapsUsed(IN ULONG Start, IN ULONG End)
+{
+    ULONG i;
+    for (i = 0; i < g_IdeIoMap.UsedCount; i++) {
+        if (Start <= g_IdeIoMap.Used[i].End && End >= g_IdeIoMap.Used[i].Start) return TRUE;
+    }
+    return FALSE;
+}
+
+/* An I/O BAR whose size is not known: a BAR is aligned to its size and
+   an I/O BAR is at most 256 bytes, so the alignment of its base bounds it */
+static VOID
+IdeIoAddBar(IN ULONG Bar)
+{
+    ULONG base, size;
+
+    if (!(Bar & 1)) return;
+    base = Bar & 0xFFFC;
+    if (base == 0 || (Bar & 0xFFFF0000UL) != 0) return;
+    size = base & (0 - base);
+    if (size > 0x100) size = 0x100;
+    IdeIoAddUsed(base, base + size - 1);
+}
+
+/* The native channels of a recorded IDE function: BAR 0/1 and 2/3 */
+static BOOLEAN
+IdeIoChannelNative(IN IDE_IO_FUNCTION *F, IN ULONG Channel)
+{
+    if (F->SubClass != PCI_SUBCLASS_IDE) return TRUE;
+    return (BOOLEAN)((F->ProgIf & (Channel ? IDE_PROGIF_SECONDARY_NATIVE : IDE_PROGIF_PRIMARY_NATIVE)) != 0);
+}
+
+static BOOLEAN
+IdeIoChannelRanges(IN IDE_IO_FUNCTION *F, IN ULONG Channel, OUT IDE_IO_RANGE *Cmd, OUT IDE_IO_RANGE *Ctl)
+{
+    ULONG cmd = F->Bar[2 * Channel], ctl = F->Bar[2 * Channel + 1];
+
+    if (!(cmd & 1) || !(ctl & 1) || (cmd & 0xFFF8) == 0 || (ctl & 0xFFFC) == 0) return FALSE;
+    Cmd->Start = cmd & 0xFFF8;
+    Cmd->End = Cmd->Start + 7;
+    Ctl->Start = ctl & 0xFFFC;
+    Ctl->End = Ctl->Start + 3;
+    return TRUE;
+}
+
+/* Every function on every bus: I/O BARs, bridge windows, IDE functions */
+static VOID
+IdeIoScan(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    IDE_IO_MAP *m = &g_IdeIoMap;
+    PCI_COMMON_CONFIG cfg;
+    PCI_SLOT_NUMBER slot;
+    PUCHAR raw = (PUCHAR)&cfg;
+    ULONG bus, device, function, i, c;
+    BOOLEAN busMissing, multiFunction;
+
+    for (bus = 0; bus < 256; bus++) {
+        for (device = 0; device < 32; device++) {
+            multiFunction = FALSE;
+            for (function = 0; function < 8; function++) {
+                if (function > 0 && !multiFunction) break;
+                slot.u.AsULONG = 0;
+                slot.u.bits.DeviceNumber = device;
+                slot.u.bits.FunctionNumber = function;
+                if (!IdeReadPciHeader(HwInit, bus, slot.u.AsULONG, &cfg, &busMissing)) {
+                    if (busMissing && device == 0 && function == 0) return;
+                    if (function == 0) break;
+                    continue;
+                }
+                if (function == 0) multiFunction = (BOOLEAN)((cfg.HeaderType & IDE_PCI_MULTIFUNCTION) != 0);
+
+                if ((cfg.HeaderType & 0x7F) == 1) {
+                    /* PCI-PCI bridge: its own BARs and the window it forwards */
+                    IdeIoAddBar(*(PULONG)&raw[0x10]);
+                    IdeIoAddBar(*(PULONG)&raw[0x14]);
+                    if (m->BridgeCount >= IDE_IO_BRIDGES_MAX) {
+                        m->Overflow = TRUE;
+                    } else {
+                        IDE_IO_BRIDGE *b = &m->Bridge[m->BridgeCount++];
+                        b->Primary = raw[0x18];
+                        b->Secondary = raw[0x19];
+                        b->Base = (ULONG)(raw[0x1C] & 0xF0) << 8;
+                        b->Limit = ((ULONG)(raw[0x1D] & 0xF0) << 8) | 0xFFF;
+                        b->WindowOn = (BOOLEAN)(b->Limit > b->Base);
+                    }
+                    continue;
+                }
+                if ((cfg.HeaderType & 0x7F) != 0) continue;
+
+                if (IdePciConfigIsIde(&cfg) && m->IdeCount >= IDE_IO_FUNCTIONS_MAX) m->Overflow = TRUE;
+                if (IdePciConfigIsIde(&cfg) && m->IdeCount < IDE_IO_FUNCTIONS_MAX) {
+                    IDE_IO_FUNCTION *f = &m->Ide[m->IdeCount++];
+                    f->Bus = bus;
+                    f->Slot = slot.u.AsULONG;
+                    f->ProgIf = cfg.ProgIf;
+                    f->SubClass = cfg.SubClass;
+                    for (i = 0; i < 5; i++) f->Bar[i] = cfg.u.type0.BaseAddresses[i];
+                    /* Compatibility-mode channels decode the legacy ports */
+                    for (c = 0; c < 2; c++) {
+                        if (IdeIoChannelNative(f, c)) continue;
+                        IdeIoAddUsed(g_IdeLegacy[c].Cmd, g_IdeLegacy[c].Cmd + 7);
+                        IdeIoAddUsed(g_IdeLegacy[c].Ctl, g_IdeLegacy[c].Ctl);
+                    }
+                    IdeIoAddBar(cfg.u.type0.BaseAddresses[4]);
+                    IdeIoAddBar(cfg.u.type0.BaseAddresses[5]);
+                    continue;
+                }
+                for (i = 0; i < 6; i++) {
+                    ULONG bar = cfg.u.type0.BaseAddresses[i];
+                    if (bar & 1) {
+                        IdeIoAddBar(bar);
+                    } else if ((bar & 0x6) == 0x4) {
+                        i++;                    /* upper half of a 64-bit memory BAR */
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* A free, aligned block for the native channels of F: upward from its
+   bus master block (in the BIOS's pool of PCI I/O space), then downward */
+static ULONG
+IdeIoFindBlock(IN IDE_IO_FUNCTION *F)
+{
+    IDE_IO_MAP *m = &g_IdeIoMap;
+    ULONG low = IDE_IO_FLOOR, high = 0xFFFF, anchor, k, i, cand;
+    LONG dir;
+
+    if (m->Overflow) return 0;
+    for (i = 0; i < m->BridgeCount; i++) {
+        if (m->Bridge[i].Secondary == F->Bus && F->Bus != 0) {
+            if (!m->Bridge[i].WindowOn) return 0;
+            if (m->Bridge[i].Base > low) low = m->Bridge[i].Base;
+            if (m->Bridge[i].Limit < high) high = m->Bridge[i].Limit;
+        }
+    }
+    anchor = ((F->Bar[4] & 1) && (F->Bar[4] & 0xFFFC) != 0) ? (F->Bar[4] & 0xFFE0) : (high & ~(IDE_IO_BLOCK - 1));
+
+    for (dir = 1; dir >= -1; dir -= 2) {
+        for (k = (dir > 0) ? 0 : 1; k < IDE_IO_SEARCH_STEPS; k++) {
+            cand = (dir > 0) ? anchor + k * IDE_IO_BLOCK : anchor - k * IDE_IO_BLOCK;
+            if (cand < low || cand + IDE_IO_BLOCK - 1 > high || cand > 0xFFFF) continue;
+            /* Clear of the ISA 10-bit aliases, and forwarded by a bridge
+               with ISA enable set */
+            if ((cand & 0x300) != 0) continue;
+            if (IdeIoOverlapsUsed(cand, cand + IDE_IO_BLOCK - 1)) continue;
+            for (i = 0; i < m->BridgeCount; i++) {
+                IDE_IO_BRIDGE *b = &m->Bridge[i];
+                if (b->Primary == F->Bus && b->WindowOn && cand <= b->Limit && cand + IDE_IO_BLOCK - 1 >= b->Base) break;
+            }
+            if (i < m->BridgeCount) continue;
+            return cand;
+        }
+    }
+    return 0;
+}
+
+/* Move the native channels of F to Block; FALSE (and the BARs as they
+   were) when the function does not take the addresses */
+static BOOLEAN
+IdeIoMoveFunction(IN PHW_DEVICE_EXTENSION HwInit, IN IDE_IO_FUNCTION *F, IN ULONG Block)
+{
+    PCI_COMMON_CONFIG cfg;
+    ULONG command, c, want[4];
+    BOOLEAN ok = TRUE;
+
+    if (!IdeReadPciHeader(HwInit, F->Bus, F->Slot, &cfg, NULL)) return FALSE;
+    command = cfg.Command;
+    IdePciWriteConfigAt(HwInit, F->Bus, F->Slot, 0x04, 2, command & ~1UL);   /* I/O decode off */
+    for (c = 0; c < 2; c++) {
+        want[2 * c] = F->Bar[2 * c];
+        want[2 * c + 1] = F->Bar[2 * c + 1];
+        if (!IdeIoChannelNative(F, c)) continue;
+        want[2 * c] = (Block + 16 * c) | 1;
+        want[2 * c + 1] = (Block + 16 * c + 8) | 1;
+        IdePciWriteConfigAt(HwInit, F->Bus, F->Slot, 0x10 + 8 * c, 4, want[2 * c]);
+        IdePciWriteConfigAt(HwInit, F->Bus, F->Slot, 0x14 + 8 * c, 4, want[2 * c + 1]);
+    }
+    if (IdeReadPciHeader(HwInit, F->Bus, F->Slot, &cfg, NULL)) {
+        for (c = 0; c < 4; c++) {
+            if ((cfg.u.type0.BaseAddresses[c] & 0xFFFC) != (want[c] & 0xFFFC)) ok = FALSE;
+        }
+    } else {
+        ok = FALSE;
+    }
+    if (!ok) {
+        for (c = 0; c < 4; c++) IdePciWriteConfigAt(HwInit, F->Bus, F->Slot, 0x10 + 4 * c, 4, F->Bar[c]);
+    }
+    IdePciWriteConfigAt(HwInit, F->Bus, F->Slot, 0x04, 2, command);
+    return ok;
+}
+
+static VOID
+IdeResolvePortConflicts(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    IDE_IO_MAP *m = &g_IdeIoMap;
+    IDE_IO_RANGE cmd, ctl;
+    ULONG f, c, block;
+    BOOLEAN conflict;
+
+    if (g_IdeIoChecked) return;
+    g_IdeIoChecked = TRUE;
+    ZeroMemoryBytes(m, sizeof(*m));
+    IdeIoScan(HwInit);
+
+    for (f = 0; f < m->IdeCount; f++) {
+        IDE_IO_FUNCTION *fn = &m->Ide[f];
+
+        conflict = FALSE;
+        for (c = 0; c < 2; c++) {
+            if (!IdeIoChannelNative(fn, c) || !IdeIoChannelRanges(fn, c, &cmd, &ctl)) continue;
+            if (IdeIoOverlapsUsed(cmd.Start, cmd.End) || IdeIoOverlapsUsed(ctl.Start, ctl.End)) conflict = TRUE;
+        }
+        if (conflict) {
+            block = IdeIoFindBlock(fn);
+            if (block != 0 && IdeIoMoveFunction(HwInit, fn, block)) {
+                IDE_DBG((IDE_PFX "Ports: bus %lu slot %08lX native channels moved from %lX to %lX "
+                         "(another controller decodes the same ports)\n",
+                         fn->Bus, fn->Slot, fn->Bar[0] & 0xFFFC, block));
+                for (c = 0; c < 2; c++) {
+                    if (!IdeIoChannelNative(fn, c)) continue;
+                    fn->Bar[2 * c] = (block + 16 * c) | 1;
+                    fn->Bar[2 * c + 1] = (block + 16 * c + 8) | 1;
+                }
+            } else {
+                IDE_DBG((IDE_PFX "Ports: bus %lu slot %08lX shares ports with another controller, "
+                         "no free I/O space found to move it\n", fn->Bus, fn->Slot));
+            }
+        }
+        for (c = 0; c < 2; c++) {
+            if (!IdeIoChannelNative(fn, c) || !IdeIoChannelRanges(fn, c, &cmd, &ctl)) continue;
+            IdeIoAddUsed(cmd.Start, cmd.End);
+            IdeIoAddUsed(ctl.Start, ctl.End);
+        }
+    }
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* DMA arena: PRD table and bounce buffer per channel                  */
@@ -803,19 +1144,71 @@ IdeSetupChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
     IdeSetControl(ch, IDE_CTL_NIEN);
 }
 
+#define IDE_SLAVE_SIGNATURE_MS          3000
+
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+static BOOLEAN g_IdeAtapiFound;
+#endif
+
+/* A slave that IDENTIFY shows as the master again: a master that does not
+   decode the device bit answers for an absent slave */
+static BOOLEAN
+IdeGhostSlave(IN PIDE_CHANNEL Ch)
+{
+    PIDE_DEVICE m = &Ch->Devices[0], s = &Ch->Devices[1];
+    ULONG i;
+    BOOLEAN serial = FALSE;
+
+    if (!m->Present || !m->IdentifyValid || !s->IdentifyValid || m->IsAtapi != s->IsAtapi) return FALSE;
+    for (i = IDE_ID_SERIAL; i < IDE_ID_SERIAL + 10; i++) {
+        if (s->Id[i] != 0 && s->Id[i] != 0x2020) serial = TRUE;
+    }
+    if (!serial) return FALSE;
+    for (i = IDE_ID_SERIAL; i < IDE_ID_WORDS; i++) {
+        if (m->Id[i] != s->Id[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 /* Reset the channel and find its devices */
 static VOID
 IdeInitializeChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
 {
     PIDE_CHANNEL ch = &HwInit->Channels[Channel];
     ULONG unit;
-    UCHAR status, lba1, lba2, c, n;
+    UCHAR status, c, n;
+    UCHAR sigStatus[IDE_DEVICES_PER_CHANNEL], sigLba1[IDE_DEVICES_PER_CHANNEL], sigLba2[IDE_DEVICES_PER_CHANNEL];
+    BOOLEAN noSignature;
 
     ch->Outstanding = NULL;
     ch->Pending = NULL;
     ch->DeviceCount = 0;
 
+    if (ch->Off) {
+        /* OFF=: no reset, no commands, no devices */
+        ZeroMemoryBytes(ch->Devices, sizeof(ch->Devices));
+        ch->NeedsSetup = FALSE;
+        IDE_DBG((IDE_PFX "Channel %lu: turned off (OFF=)\n", Channel));
+        return;
+    }
+
     IdeResetChannel(HwInit, Channel);
+
+    /* Both signatures first: a register write reaches both devices, so
+       probing the master would overwrite the signature of a packet
+       device behind it */
+    for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+        ULONG ms;
+        IdeSelectUnit(ch, unit);
+        /* the reset waited for the master; a slave may still be busy */
+        for (ms = 0; ms < IDE_SLAVE_SIGNATURE_MS; ms++) {
+            sigStatus[unit] = IdeAltStatus(ch);
+            if (sigStatus[unit] == 0xFF || !(sigStatus[unit] & IDE_STS_BSY)) break;
+            ScsiPortStallExecution(1000);
+        }
+        sigLba1[unit] = IDE_INB(ch->Cmd + IDE_REG_LBA1);
+        sigLba2[unit] = IDE_INB(ch->Cmd + IDE_REG_LBA2);
+    }
 
     for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
         PIDE_DEVICE dev = &ch->Devices[unit];
@@ -827,14 +1220,18 @@ IdeInitializeChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
         dev->WantLookAhead = wantLa;
         dev->DmaErrors = dmaErrors;
 
+        if (ch->UnitsOff & (1U << unit)) {
+            IDE_DBG((IDE_PFX "Channel %lu.%lu: turned off (OFF=)\n", Channel, unit));
+            continue;
+        }
         IdeSelectUnit(ch, unit);
-        status = IdeAltStatus(ch);
-        lba1 = IDE_INB(ch->Cmd + IDE_REG_LBA1);
-        lba2 = IDE_INB(ch->Cmd + IDE_REG_LBA2);
-        dev->IsAtapi = (BOOLEAN)(lba1 == IDE_SIG_ATAPI_LBA1 && lba2 == IDE_SIG_ATAPI_LBA2);
-        /* Floating bus; or nothing at all (a packet device leaves DRDY
-           clear after a reset, so only its signature tells it apart) */
-        if (status == 0xFF || (status == 0x00 && !dev->IsAtapi)) continue;
+        status = sigStatus[unit];
+        dev->IsAtapi = (BOOLEAN)(sigLba1[unit] == IDE_SIG_ATAPI_LBA1 && sigLba2[unit] == IDE_SIG_ATAPI_LBA2);
+        /* Floating bus */
+        if (status == 0xFF) continue;
+        /* Status 0 and no signature: nothing, or a packet device (DRDY
+           clear after a reset) that left no signature */
+        noSignature = (BOOLEAN)(status == 0x00 && !dev->IsAtapi);
 
         /* A device: it answers in its registers (a master shadows an
            absent slave only until the status is read) */
@@ -843,8 +1240,9 @@ IdeInitializeChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
         c = IDE_INB(ch->Cmd + IDE_REG_COUNT);
         n = IDE_INB(ch->Cmd + IDE_REG_LBA0);
         if (c != 0x55 || n != 0xAA) {
-            if (!IdeWaitStatus(ch, IDE_STS_BSY, 0, 1000)) continue;
+            if (noSignature || !IdeWaitStatus(ch, IDE_STS_BSY, 0, 1000)) continue;
         }
+        if (noSignature) dev->IsAtapi = TRUE;
         dev->Present = TRUE;
 
         if (!IdeIdentifyDevice(HwInit, Channel, unit)) {
@@ -857,6 +1255,14 @@ IdeInitializeChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
             }
         }
         IdeParseIdentify(HwInit, Channel, unit);
+        if (unit == 1 && IdeGhostSlave(ch)) {
+            IDE_DBG((IDE_PFX "Channel %lu.1: the master answers for an absent slave, ignored\n", Channel));
+            dev->Present = FALSE;
+            continue;
+        }
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+        if (dev->IsAtapi) g_IdeAtapiFound = TRUE;
+#endif
         IdeSelectTransferMode(HwInit, Channel, unit);
         IdeApplyDeviceSettings(HwInit, Channel, unit);
         ch->DeviceCount++;
@@ -1027,6 +1433,14 @@ LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex,
 LONG __stdcall ZwQueryValueKey(PVOID KeyHandle, PVOID ValueName, ULONG KeyValueInformationClass,
                                PVOID KeyValueInformation, ULONG Length, PULONG ResultLength);
 LONG __stdcall ZwClose(PVOID Handle);
+#if !defined(IDE_NT4)
+BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG BuildNumber,
+                               PIDE_UNICODE_STRING CsdVersion);
+#else
+/* hal.dll, every NT version; KIRQL and KAFFINITY as UCHAR and ULONG */
+ULONG __stdcall HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber, ULONG BusInterruptLevel,
+                                      ULONG BusInterruptVector, PUCHAR Irql, PULONG Affinity);
+#endif
 
 #define IDE_OBJ_CASE_INSENSITIVE        0x00000040
 #define IDE_OBJ_KERNEL_HANDLE           0x00000200
@@ -1124,6 +1538,11 @@ static USHORT g_IdeAtdiskSaved[] = L"InboxStart_atdisk";
 static USHORT g_IdeAtapiSaved[] = L"InboxStart_atapi";
 static USHORT g_IdeScsidiskName[] = L"scsidisk";
 static USHORT g_IdeDiskName[] = L"disk";
+static USHORT g_IdeScsicdrmName[] = L"scsicdrm";
+static USHORT g_IdeCdromName[] = L"cdrom";
+static USHORT g_IdeCdfsName[] = L"cdfs";
+static USHORT g_IdeCdfsRecName[] = L"cdfs_rec";
+static USHORT g_IdeFsRecName[] = L"fs_rec";
 
 static BOOLEAN g_IdeAdapterFound;
 
@@ -1163,6 +1582,52 @@ IdeRegWriteDword(IN PVOID Key, IN USHORT *Name, IN ULONG Bytes, IN ULONG Value)
 
     IdeInitString(&name, Name, Bytes);
     ZwSetValueKey(Key, &name, 0, IDE_REG_DWORD, &Value, sizeof(Value));
+}
+
+/* Start of a service, 0xFFFFFFFF without key or value */
+static ULONG
+IdeServiceStart(IN PVOID Services, IN USHORT *Name, IN ULONG Bytes)
+{
+    PVOID key = IdeRegOpen(Services, Name, Bytes);
+    ULONG start = 0xFFFFFFFF;
+
+    if (key == NULL) return start;
+    if (!IdeRegReadDword(key, g_IdeStartName, sizeof(g_IdeStartName), &start)) start = 0xFFFFFFFF;
+    ZwClose(key);
+    return start;
+}
+
+/* A service at Start 4 to 1 (system); TRUE when its key exists */
+static BOOLEAN
+IdeServiceEnable(IN PVOID Services, IN USHORT *Name, IN ULONG Bytes, IN PCHAR Text)
+{
+    PVOID key = IdeRegOpen(Services, Name, Bytes);
+    ULONG start;
+
+    if (key == NULL) return FALSE;
+    if (IdeRegReadDword(key, g_IdeStartName, sizeof(g_IdeStartName), &start) && start == 4) {
+        IdeRegWriteDword(key, g_IdeStartName, sizeof(g_IdeStartName), 1);
+        IDE_DBG((IDE_PFX "DriverEntry: %s, Start 4 -> 1\n", Text));
+    }
+    ZwClose(key);
+    return TRUE;
+}
+
+/* A CD-ROM drive was found: its class driver (scsicdrm on NT 3.x, cdrom
+   on NT 4.0) and CDFS have to start. NT 3.1 has no IDE CD-ROM support, so
+   an installation on IDE leaves them at Start 4. CDFS is left alone when
+   a file system recognizer loads it (cdfs_rec on NT 3.x, fs_rec on 4.0). */
+static VOID
+IdeEnableCdromDrivers(IN PVOID Services)
+{
+    ULONG rec;
+
+    if (!IdeServiceEnable(Services, g_IdeScsicdrmName, sizeof(g_IdeScsicdrmName), "scsicdrm")) {
+        IdeServiceEnable(Services, g_IdeCdromName, sizeof(g_IdeCdromName), "cdrom");
+    }
+    rec = IdeServiceStart(Services, g_IdeCdfsRecName, sizeof(g_IdeCdfsRecName));
+    if (rec >= 4) rec = IdeServiceStart(Services, g_IdeFsRecName, sizeof(g_IdeFsRecName));
+    if (rec >= 4) IdeServiceEnable(Services, g_IdeCdfsName, sizeof(g_IdeCdfsName), "cdfs");
 }
 
 static VOID
@@ -1234,6 +1699,7 @@ IdeDisableInboxDrivers(IN PVOID RegistryPath)
         ZwClose(key);
         break;
     }
+    if (g_IdeAtapiFound) IdeEnableCdromDrivers(services);
     ZwClose(services);
     ZwClose(ident);
 }
@@ -1248,6 +1714,24 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     g_IdeDumpMode = (BOOLEAN)(DriverObject == NULL);
 
     IDE_DBG((IDE_PFX "DriverEntry%s\n", g_IdeDumpMode ? " (dump)" : ""));
+
+#if !defined(IDE_NT4)
+#if defined(_AMD64_)
+    g_IdeCapacity16 = TRUE;
+#else
+    {
+        ULONG major = 0, minor = 0, build = 0;
+        IDE_UNICODE_STRING csd;
+        csd.Length = 0;
+        csd.MaximumLength = 0;
+        csd.Buffer = NULL;
+        PsGetVersion(&major, &minor, &build, &csd);
+        g_IdeCapacity16 = (BOOLEAN)(major > 5 || (major == 5 && minor >= 2 && (build > 3790 || csd.Length != 0)));
+        IDE_DBG((IDE_PFX "DriverEntry: Windows %lu.%lu.%lu%s\n", major, minor, build,
+                 g_IdeCapacity16 ? ", READ CAPACITY(16) used" : ""));
+    }
+#endif
+#endif
 
     ZeroMemoryBytes(&initData, sizeof(HW_INITIALIZATION_DATA));
 
@@ -1405,6 +1889,72 @@ IdeSetAccessRange(IN PPORT_CONFIGURATION_INFORMATION ConfigInfo, IN ULONG Index,
     ranges[Index].RangeInMemory = FALSE;
 }
 
+static PCHAR
+IdeParseDecimal(IN PCHAR P, OUT PULONG Value)
+{
+    ULONG v = 0;
+    PCHAR start = P;
+
+    while (*P >= '0' && *P <= '9') v = v * 10 + (ULONG)(*P++ - '0');
+    *Value = v;
+    return (P == start) ? NULL : P;
+}
+
+/* OFF=item[,item...]: channels and devices the driver leaves alone.
+   item = [bus.device.function:]channel[.unit], all decimal: channel 0 is
+   the primary, 1 the secondary; unit 0 the master, 1 the slave. With the
+   PCI location (as Device Manager shows it) the item applies to that
+   controller only, without it to every controller. TRUE when the whole
+   channel is off; UnitsOff gets the units turned off one by one. */
+static BOOLEAN
+IdeOffLookup(IN PCHAR Args, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULONG Channel, OUT PUCHAR UnitsOff)
+{
+    ULONG i, j, n, v[5], count, colon;
+    PCHAR p;
+    CHAR a;
+    BOOLEAN off = FALSE;
+    UCHAR units = 0;
+    PCI_SLOT_NUMBER slot;
+
+    slot.u.AsULONG = Slot;
+    for (i = 0; Args != NULL && Args[i] != 0; i++) {
+        static const CHAR key[] = "OFF=";
+        for (j = 0; key[j] != 0; j++) {
+            a = Args[i + j];
+            if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
+            if (a != key[j]) break;
+        }
+        if (key[j] != 0) continue;
+        p = &Args[i + j];
+        for (;;) {
+            count = 0;
+            colon = 0;
+            while (count < 5) {
+                p = IdeParseDecimal(p, &n);
+                if (p == NULL) break;
+                v[count++] = n;
+                if (*p == ':' && count == 3 && colon == 0) { colon = 3; p++; continue; }
+                if (*p == '.') { p++; continue; }
+                break;
+            }
+            if (p == NULL) break;
+            if (colon != 0 && (!Pci || v[0] != Bus || v[1] != slot.u.bits.DeviceNumber ||
+                               v[2] != slot.u.bits.FunctionNumber)) {
+                count = 0;          /* another controller */
+            }
+            n = count - colon;
+            if (count > colon && v[colon] == Channel) {
+                if (n == 1) off = TRUE;
+                else if (n == 2 && v[colon + 1] < IDE_DEVICES_PER_CHANNEL) units |= (UCHAR)(1U << v[colon + 1]);
+            }
+            if (*p != ',') break;
+            p++;
+        }
+    }
+    if (UnitsOff != NULL) *UnitsOff = units;
+    return off;
+}
+
 ULONG
 IdeFindAdapter(
     IN PVOID DeviceExtension,
@@ -1421,7 +1971,7 @@ IdeFindAdapter(
     ULONG descCount = 0, first = 0, count = 0;
     ULONG targetBus = 0, targetSlot = 0;
     ULONG i, c;
-    BOOLEAN hasSlot, pci = FALSE, legacyPass;
+    BOOLEAN hasSlot, pci = FALSE, legacyPass, nativeOnly = FALSE;
     BOOLEAN interrupts, level2;
     INTERFACE_TYPE busType;
     ULONG busNumber;
@@ -1449,7 +1999,24 @@ IdeFindAdapter(
                            ConfigInfo->SlotNumber == 0 && ConfigInfo->NumberOfAccessRanges != 0 &&
                            (*ConfigInfo->AccessRanges)[0].RangeLength == 0);
 #endif
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+    /* Before the first channel is taken */
+    if (legacyPass) IdeResolvePortConflicts(hwInit);
+#endif
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+    /* NATIVEFIRST=1: channels in native mode get the first adapters (and
+       disk numbers), for NT 3.1 booting from a native-mode controller */
+    if (legacyPass && IdeArgPresent(ArgumentString, "NATIVEFIRST=1")) {
+        ULONG b, s;
+        nativeOnly = IdeScanPci(hwInit, TRUE, &b, &s, &pciConfig);
+    }
+#endif
     hwInit->DmaAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "DMA=0");
+    hwInit->TrimAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "TRIM=0");
+    hwInit->StandbyAtShutdown = IdeArgPresent(ArgumentString, "STANDBY=1");
+    hwInit->Capacity16 = g_IdeCapacity16;
+    if (IdeArgPresent(ArgumentString, "RC16=1")) hwInit->Capacity16 = TRUE;
+    if (IdeArgPresent(ArgumentString, "RC16=0")) hwInit->Capacity16 = FALSE;
     hwInit->DmaForced = IdeArgPresent(ArgumentString, "DMA=1");
     hwInit->PciWritable = TRUE;
 
@@ -1458,6 +2025,13 @@ IdeFindAdapter(
              hasSlot ? ConfigInfo->SlotNumber : 0xFFFFFFFF, ConfigInfo->NumberOfAccessRanges,
              ConfigInfo->BusInterruptLevel, hwInit->DumpMode ? ", dump" : ""));
 
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+selectChannel:
+#endif
+    pci = FALSE;
+    descCount = 0;
+    first = 0;
+    count = 0;
     /* Step 1: the PCI function ScsiPort / PnP / SCSIPORT.PDR called us for */
     if (hasSlot && ConfigInfo->AdapterInterfaceType == PCIBus) {
         targetBus = ConfigInfo->SystemIoBusNumber;
@@ -1472,7 +2046,7 @@ IdeFindAdapter(
             if (!legacyPass && descCount != 0) pci = TRUE;
 #endif
             for (i = 0; i < descCount && !pci; i++) {
-                if (!IdeIsPortClaimed(desc[i].CmdPort)) pci = TRUE;
+                if (!IdeIsPortClaimed(desc[i].CmdPort) && (!nativeOnly || desc[i].Native)) pci = TRUE;
             }
 #if !defined(IDE_NT4)
             if (!pci && !legacyPass) return SP_RETURN_NOT_FOUND;
@@ -1484,14 +2058,14 @@ IdeFindAdapter(
        NT 3.1 scan the bus themselves) */
 #if defined(IDE_NT4)
     if (!pci && ConfigInfo->AdapterInterfaceType != Isa) {
-        if (IdeScanPci(hwInit, &targetBus, &targetSlot, &pciConfig)) {
+        if (IdeScanPci(hwInit, nativeOnly, &targetBus, &targetSlot, &pciConfig)) {
             descCount = IdeDescribePciChannels(&pciConfig, desc);
             pci = TRUE;
         }
     }
 #ifdef IDE_NT31_COMPAT
     /* NT 3.1: one ISA pass does the PCI functions too */
-    if (!pci && !hasSlot && IdeScanPci(hwInit, &targetBus, &targetSlot, &pciConfig)) {
+    if (!pci && !hasSlot && IdeScanPci(hwInit, nativeOnly, &targetBus, &targetSlot, &pciConfig)) {
         descCount = IdeDescribePciChannels(&pciConfig, desc);
         pci = TRUE;
     }
@@ -1501,7 +2075,8 @@ IdeFindAdapter(
 
     if (pci) {
         /* Which of the function's channels, and how many, this instance takes */
-        for (first = 0; first < descCount && IdeIsPortClaimed(desc[first].CmdPort); first++) ;
+        for (first = 0; first < descCount &&
+                        (IdeIsPortClaimed(desc[first].CmdPort) || (nativeOnly && !desc[first].Native)); first++) ;
 #if !defined(IDE_NT4)
         if (!legacyPass) first = 0;             /* PnP start: the whole function */
 #endif
@@ -1612,6 +2187,17 @@ IdeFindAdapter(
 #endif
     }
 
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+    /* A channel turned off as a whole (OFF=) gets no adapter: its ports
+       stay free. The next channel is taken instead. */
+    if (legacyPass && count == 1 &&
+        IdeOffLookup(ArgumentString, pci, targetBus, targetSlot, desc[first].Index, NULL)) {
+        IDE_DBG((IDE_PFX "FindAdapter: channel at %lX turned off (OFF=)\n", (ULONG)desc[first].CmdPort));
+        IdeClaimPort(desc[first].CmdPort);
+        goto selectChannel;
+    }
+#endif
+
     /* Bus type and number for mapping and the interrupt */
     busType = ConfigInfo->AdapterInterfaceType;
     busNumber = ConfigInfo->SystemIoBusNumber;
@@ -1658,6 +2244,25 @@ IdeFindAdapter(
             ConfigInfo->BusInterruptLevel = 0;
             ConfigInfo->BusInterruptVector = 0;
         }
+#if defined(IDE_NT4) && !defined(IDE_W9X)
+        /* The HAL must have a vector for the line: an MPS HAL whose MP
+           table has no entry for it gives none, and ScsiPort would then
+           fail the adapter (0x7B with the system disk on it). Fast Polling
+           needs no interrupt. */
+        if (ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0) {
+            UCHAR irql = 0;
+            ULONG affinity = 0;
+            ULONG vector = HalGetInterruptVector(ConfigInfo->AdapterInterfaceType, ConfigInfo->SystemIoBusNumber,
+                                                 ConfigInfo->BusInterruptLevel, ConfigInfo->BusInterruptVector,
+                                                 &irql, &affinity);
+            if (vector == 0 || affinity == 0) {
+                IDE_DBG((IDE_PFX "FindAdapter: no vector for IRQ %lu (vector %lu, affinity %lX), Fast Polling\n",
+                         ConfigInfo->BusInterruptLevel, vector, affinity));
+                ConfigInfo->BusInterruptLevel = 0;
+                ConfigInfo->BusInterruptVector = 0;
+            }
+        }
+#endif
         /* Report the ranges this instance uses. On 2000/XP a PCI function's
            ports are on record with its device node; reported again here they
            would conflict with it. */
@@ -1682,6 +2287,8 @@ IdeFindAdapter(
         if (!IdeAttachChannel(hwInit, ConfigInfo, busType, busNumber, c, &desc[first + c])) {
             return SP_RETURN_ERROR;
         }
+        hwInit->Channels[c].Off = IdeOffLookup(ArgumentString, pci, targetBus, targetSlot, desc[first + c].Index,
+                                               &hwInit->Channels[c].UnitsOff);
     }
     hwInit->ChannelCount = (UCHAR)count;
     if (hwInit->HasPci && !IdeChipSetup(hwInit, &pciConfig, busType, busNumber)) {
@@ -1703,7 +2310,7 @@ IdeFindAdapter(
     ConfigInfo->MaximumTransferLength = IDE_MAX_TRANSFER;
     ConfigInfo->NumberOfPhysicalBreaks = IDE_MAX_PHYS_BREAKS;
     ConfigInfo->AlignmentMask = 0x1;
-    ConfigInfo->CachesData = FALSE;
+    ConfigInfo->CachesData = TRUE;             /* ScsiPort passes SRB_FUNCTION_SHUTDOWN and FLUSH only then */
 
     /* A 32-bit scatter/gather master. Also for a PCI channel without a
        bus master: ScsiPort allocates the uncached extension (PRD tables,
@@ -1746,8 +2353,22 @@ IdeFindAdapter(
         PIDE_CHANNEL ch = &hwInit->Channels[c];
         /* The second channel of a PnP-started compatibility-mode function:
            ScsiPort connects only the first interrupt of a PnP adapter */
-        ch->Async = (BOOLEAN)(interrupts && ch->Bm != NULL &&
-                              (c == 0 || ch->Native || (level2 && legacyPass)));
+        BOOLEAN line = (BOOLEAN)(c == 0 || ch->Native || (level2 && legacyPass));
+#if !defined(IDE_NT4)
+        if (!legacyPass) {
+            /* PnP start: the one interrupt in the resources. A channel in
+               compatibility mode raises its ISA IRQ, a native one the PCI
+               line (one of each in a function with mixed modes). */
+            ULONG irq = ConfigInfo->BusInterruptLevel, k;
+            BOOLEAN mixed = FALSE;
+            for (k = 0; k < count; k++) {
+                if (!hwInit->Channels[k].Native) mixed = TRUE;
+            }
+            line = (BOOLEAN)(ch->Native ? !(mixed && (irq == IDE_LEGACY_PRIMARY_IRQ || irq == IDE_LEGACY_SECONDARY_IRQ))
+                                        : (irq == ch->Irq));
+        }
+#endif
+        ch->Async = (BOOLEAN)(interrupts && ch->Bm != NULL && line);
     }
 
     IDE_DBG((IDE_PFX "FindAdapter: %lu channel(s) at %lX%s, IRQ %lu/%lu, %s%s\n",
@@ -1874,7 +2495,7 @@ IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
             c = Srb->TargetId / IDE_DEVICES_PER_CHANNEL;
             unit = IDE_UNIT_OF_TARGET(Srb->TargetId);
             if (Srb->Function == SRB_FUNCTION_SHUTDOWN) {
-                for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) IdeFlushDevice(hwInit, c, unit);
+                for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) IdeShutdownDevice(hwInit, c, unit);
             } else {
                 IdeFlushDevice(hwInit, c, unit);
             }

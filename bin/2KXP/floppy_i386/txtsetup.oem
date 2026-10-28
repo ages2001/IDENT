@@ -388,6 +388,7 @@ id = "PCI\VEN_1078&DEV_0102&CC_010105", "IDENT"
 
 driver = d1, IDENT.sys, IDENT
 inf    = d1, IDENT.inf
+dll    = d1, identpp.dll
 
 
 [Config.scsi.IDENT]

@@ -8,11 +8,12 @@ Signature="$Windows NT$"
 Class=SCSIAdapter
 ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=10/07/2026,1.0.0.0
+DriverVer=10/19/2026,1.1.0.0
 PnpLockdown=1
 
 [DestinationDirs]
 DefaultDestDir = 12  ; DIRID_DRIVERS
+Ide_PageFiles = 11  ; DIRID_SYSTEM (Device Manager page)
 
 ;-------------------------------------------------------------------------------
 ;                    Source disks
@@ -23,12 +24,15 @@ DefaultDestDir = 12  ; DIRID_DRIVERS
 
 [SourceDisksFiles]
 IDENT.sys=1
+identpp.dll=1
 
 [SourceDisksFiles.x86]
 IDENT.sys=1
+identpp.dll=1
 
 [SourceDisksFiles.amd64]
 IDENT.sys=1
+identpp.dll=1
 
 ;-------------------------------------------------------------------------------
 ;                    Models
@@ -1078,8 +1082,8 @@ IDENT.sys=1
 ; primary channel interrupt-driven, the secondary with Fast Polling.
 
 [Ide_Inst]
-CopyFiles = Ide_CopyFiles
-AddReg    = Ide_Inbox_AddReg
+CopyFiles = Ide_CopyFiles, Ide_PageFiles
+AddReg    = Ide_Inbox_AddReg, Ide_PageReg
 
 [Ide_Inst.Services]
 AddService = IDENT, %SPSVCINST_ASSOCSERVICE%, Ide_Service_Inst, Miniport_EventLog_Inst
@@ -1094,6 +1098,12 @@ AddReg         = Ide_AddReg
 
 [Ide_CopyFiles]
 IDENT.sys
+
+[Ide_PageFiles]
+identpp.dll
+
+[Ide_PageReg]
+HKR,,EnumPropPages32,,"identpp.dll,PortPageProvider"
 
 ; The in-box IDE drivers are turned off: atapi (the channel driver), pciide
 ; and the chipset bus drivers that sit under it. A key that does not exist

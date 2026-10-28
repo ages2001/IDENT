@@ -59,7 +59,7 @@
 #define IDE_DRIVER_NAME         "IDENT"
 #endif
 
-#define IDE_DRIVER_VERSION      0x01000000  /* 1.0.0.0 */
+#define IDE_DRIVER_VERSION      0x01010000  /* 1.1.0.0 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -137,7 +137,7 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_MAX_CHANNELS                2           /* per adapter instance */
 #define IDE_DEVICES_PER_CHANNEL         2
 #define IDE_MAX_TARGETS                 (IDE_MAX_CHANNELS * IDE_DEVICES_PER_CHANNEL)
-#define IDE_MAX_CONTROLLERS             8
+#define IDE_MAX_CONTROLLERS             32
 #define IDE_MAX_TRANSFER                0x20000     /* 128 KB */
 #define IDE_SECTOR_SIZE                 512
 #define IDE_MAX_SECTOR_SIZE             4096
@@ -265,6 +265,13 @@ typedef ULONG IDE_PORTADDR;
 /* ATA                                                                 */
 /* ------------------------------------------------------------------ */
 
+#define IDE_COMMAND_DATA_SET_MANAGEMENT 0x06
+#define IDE_DSM_TRIM                    0x0001
+#define IDE_DSM_RANGES_PER_BLOCK        64
+#define IDE_DSM_MAX_RANGE               0xFFFF
+#define IDE_SMART_RETURN_STATUS_FEATURE 0xDA
+#define IDE_SMART_READ_DATA_FEATURE     0xD0
+#define IDE_SMART_LBA_SIGNATURE         0xC24F00    /* LBA 23:8 = C2h 4Fh */
 #define IDE_COMMAND_READ_SECTORS        0x20
 #define IDE_COMMAND_READ_SECTORS_EXT    0x24
 #define IDE_COMMAND_READ_DMA_EXT        0x25
@@ -343,6 +350,14 @@ typedef ULONG IDE_PORTADDR;
 #define IDW_HW_RESET_RESULT             93
 #define IDW_LBA48_SECTORS               100
 #define IDW_SECTOR_SIZE_INFO            106
+#define IDW_ADDITIONAL_SUPPORTED        69
+#define IDW_DSM_MAX_BLOCKS              105
+#define IDW_FORM_FACTOR                 168
+#define IDW_DSM_SUPPORT                 169
+#define IDW_ROTATION_RATE               217
+#define IDW69_DETERMINISTIC_TRIM        0x4000
+#define IDW69_ZERO_AFTER_TRIM           0x0020
+#define IDW169_TRIM                     0x0001
 #define IDW_LOGICAL_SECTOR_WORDS        117
 
 #define IDW0_ATAPI                      0x8000      /* bit 15 set, 14 clear */
@@ -407,6 +422,8 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_SCSIOP_VERIFY16             0x8F
 #define IDE_SCSIOP_SYNC_CACHE16         0x91
 #define IDE_SCSIOP_SERVICE_ACTION_IN16  0x9E
+#define IDE_SCSIOP_UNMAP                0x42
+#define IDE_SCSIOP_LOG_SENSE            0x4D
 #define IDE_SA_READ_CAPACITY16          0x10
 #define IDE_READ_CAPACITY16_DATA_LEN    32
 
@@ -414,6 +431,16 @@ typedef ULONG IDE_PORTADDR;
 
 #define IDE_VPD_SUPPORTED_PAGES         0x00
 #define IDE_VPD_SERIAL_NUMBER           0x80
+#define IDE_VPD_BLOCK_LIMITS            0xB0
+#define IDE_VPD_BLOCK_CHARACTERISTICS   0xB1
+#define IDE_VPD_PROVISIONING            0xB2
+
+#define IDE_LOG_PAGE_SUPPORTED          0x00
+#define IDE_LOG_PAGE_TEMPERATURE        0x0D
+#define IDE_LOG_PAGE_INFO_EXCEPTIONS    0x2F
+#define IDE_ASC_FAILURE_PREDICTION      0x5D
+#define IDE_UNMAP_MAX_DESCRIPTORS       64
+#define IDE_UNMAP_MAX_BLOCKS            (IDE_DSM_RANGES_PER_BLOCK * IDE_DSM_MAX_RANGE)
 
 #define IDE_MODE_PAGE_CACHING           0x08
 #define IDE_MODE_PAGE_GEOMETRY          0x04
@@ -496,10 +523,14 @@ typedef struct _IDE_SRB_IO_CONTROL {
 #define IDE_IOCTL_GET_INFO              0x00000001
 #define IDE_IOCTL_POWER_DOWN            0x00000010  /* flush, standby, channels stopped */
 #define IDE_IOCTL_POWER_UP              0x00000011  /* set the channels up again */
+#define IDE_IOCTL_TRIM_MODE_ON          0x00000020  /* 4 KB pattern after the header */
+#define IDE_IOCTL_TRIM_MODE_OFF         0x00000021
+#define IDE_TRIM_PATTERN_SIZE           4096
 
 #define IDE_INFO_ASYNC                  0x00000001  /* DMA completions by interrupt */
 #define IDE_INFO_POWERED_DOWN           0x00000002
 #define IDE_INFO_BUS_MASTER             0x00000004  /* bus master registers present */
+#define IDE_INFO_TRIM_MODE              0x00000008  /* writes of the TRIM pattern become TRIMs */
 
 /* Per device in IDE_IOCTL_INFO.Mode: type in bits 7:4, mode in 3:0;
    0xFF no device */
@@ -640,6 +671,14 @@ typedef struct _IDE_DEVICE {
     BOOLEAN                 NoLba48Dma;     /* 48-bit reads/writes with PIO commands */
     UCHAR                   MaxSectors;     /* sectors per command, 0 = no limit */
 
+    /* DATA SET MANAGEMENT TRIM, medium (IDENTIFY words 69, 168, 169, 217) */
+    BOOLEAN                 Trim;
+    BOOLEAN                 TrimZeroes;     /* deterministic zeroes after TRIM */
+    BOOLEAN                 Smart;          /* SMART supported and enabled */
+    BOOLEAN                 Standby;        /* STANDBY IMMEDIATE at shutdown done */
+    USHORT                  RotationRate;   /* 1 = non-rotating */
+    UCHAR                   FormFactor;
+
     /* MODE SELECT settings, applied again after a reset: 0 as the drive
        has it, 1 on, 2 off */
     UCHAR                   WantWriteCache;
@@ -665,6 +704,8 @@ typedef struct _IDE_CHANNEL {
     UCHAR                   Irq;            /* reported, for GET_INFO */
     USHORT                  CmdPort;        /* I/O port numbers, for GET_INFO */
     USHORT                  BmPort;
+    BOOLEAN                 Off;            /* OFF=: the channel is left alone */
+    UCHAR                   UnitsOff;       /* OFF=c.u: bit 0 master, bit 1 slave left alone */
 
     PUCHAR                  Cmd;            /* mapped command block */
     PUCHAR                  Ctl;            /* mapped control register */
@@ -779,6 +820,12 @@ typedef struct _HW_DEVICE_EXTENSION {
     PUCHAR                  DmaArea;
     ULONG                   DmaLength;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
+
+    BOOLEAN                 TrimAllowed;    /* TRIM=0 turns UNMAP off */
+    BOOLEAN                 Capacity16;     /* class driver follows up with READ CAPACITY(16) */
+    BOOLEAN                 StandbyAtShutdown; /* STANDBY=1: spin down on SRB_FUNCTION_SHUTDOWN */
+    BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
+    UCHAR                   TrimPattern[IDE_TRIM_PATTERN_SIZE];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
 /* One ATA/ATAPI command to put on the wire */
@@ -883,6 +930,7 @@ VOID    IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UL
 VOID    IdeSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb);
 VOID    IdeProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb);
 BOOLEAN IdeFlushDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit);
+VOID    IdeShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit);
 VOID    IdeSatlCompleteAtaError(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb);
 VOID    IdeSatlCompleteDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Result);
 BOOLEAN IdeSatlStartPending(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb);

@@ -1,6 +1,44 @@
-# IDENT - PATA/SATA IDE Driver for Windows NT/2000/XP and Windows 95/98/Me
+# IDENT — PATA/SATA IDE Driver for Windows 95/98/Me and Windows NT 3.1 to XP x64
 
-A parallel ATA / SATA-in-IDE-mode storage controller driver for the Windows NT family and Windows 95/98/Me, targeting operating systems from Windows 95 and Windows NT 3.1 up through Windows XP x64 Edition / Server 2003 x64. It drives the controller the way AHCINT drives an AHCI HBA and nvme2k an NVMe controller: one SCSI miniport, one source tree, every operating system in the range.
+**IDENT** is a SCSI miniport driver for IDE controllers: parallel ATA, and SATA controllers running in IDE mode. It replaces the in-box `atdisk`, `atapi` and `ESDI_506` drivers of Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP and Server 2003 (x86 and x64) with one driver that gives every one of these systems UDMA, 48-bit LBA, native-mode controllers on any interrupt, large sectors, SMART and TRIM.
+
+| | |
+|---|---|
+| **Version** | 1.1.0.0 |
+| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 |
+| **Hardware** | PCI IDE controllers (class code `01-01`) in compatibility or native mode; SATA controllers in IDE mode (Intel, VIA, AMD, nVidia, SiS, ALi and others; Silicon Image 3112/3512/3114 and ATI IXP SATA); legacy ISA/VLB channels; up to 32 controllers |
+| **Devices** | PATA and SATA disks (48-bit LBA, 512-byte to 4 KB logical sectors, SSDs with TRIM), ATAPI CD/DVD drives, removable ATAPI disks (ZIP, LS-120/SuperDisk) |
+| **Binaries** | `ident9x.mpd` (Windows 9x/Me) · `ident.sys` (NT 3.1–4.0) · `ident.sys` (2000/XP/2003, x86 and x64) |
+
+## Highlights
+
+- **The fastest transfer mode, whatever the BIOS did**: UDMA 0–6 and MWDMA with the controller timing programmed on Intel PIIX/ICH, CMD 64x and Silicon Image 311x, BIOS settings kept elsewhere, and PIO as the fallback for every case DMA cannot handle
+- **Native (enhanced) mode controllers** on any interrupt, compatibility mode on IRQ 14/15, and legacy ISA channels — on every target, NT 3.1 included
+- **Every controller in the machine**, side by side: on the NT family a native-mode controller that the BIOS left on the legacy ports is moved to free I/O space, so it no longer hides the drives of the compatibility-mode controller (see [Several controllers in one machine](#several-controllers-in-one-machine))
+- **Interrupt-driven DMA** with a watchdog that falls back to Fast Polling where the interrupt routing is wrong
+- **Chip errata** handled as Linux does: CMD 64x interrupt latches, SiI3112 "mod15write", RZ1000/CMD640 read-ahead, ALi, ServerWorks and Intel 450NX limits
+- **48-bit LBA, 16-byte CDBs and 4 KB sectors** on every target; **TRIM** for SATA SSDs, plus `tools\trimnt.exe` for the free space of a volume
+- **SMART** through the `atapi.sys`-compatible "SCSIDISK" IOCTL, ATA PASS-THROUGH, and LOG SENSE health and temperature pages
+- **Clean takeover**: the in-box IDE drivers are turned off on installation (and restored on removal on NT), the F6 and OEM setup disks keep the controller on IDENT
+- **Power management**: flush at shutdown (standby with `STANDBY=1`), hibernation and crash dumps on 2000/XP, a power-down IOCTL for NT 3.1–4.0 and 9x
+
+- **Channels tab in Device Manager** (2000/XP/x64): check boxes to turn single channels and devices off, without editing the registry
+## Quick start
+
+| System | Files | How |
+|---|---|---|
+| Windows 95 / 98 / Me | `bin\9X` | [Installing on Windows 95 / 98 / Me](#windows-95--98--me) |
+| Windows NT 3.1 – 4.0 | `bin\NT\floppy` | [Installing on Windows NT](#windows-nt-31--350--351--nt-40) |
+| Windows 2000 / XP / 2003, installed | `bin\2KXP` (Update Driver, Have Disk) | [GUI-mode setup](#gui-mode-setup-windows-2000xpxp-x64server-2003) |
+| Windows 2000 / XP / 2003, new installation | `bin\2KXP\floppy_i386` or `floppy_amd64` (F6) | [Text-mode (F6) setup](#text-mode-f6-setup--windows-2000xpxp-x64server-2003) |
+
+Read [In-box IDE drivers](#in-box-ide-drivers) before installing on a machine with more than one IDE controller.
+
+## Contents
+
+- [Overview](#overview) · [Features](#features) · [Architecture](#architecture) · [Feature matrix by target](#feature-matrix-by-target) · [Known Limitations](#known-limitations)
+- [Building from source](#building-from-source) · [Installation](#installation) · [Configuration](#configuration) · [Debugging](#debugging) · [Technical Notes](#technical-notes)
+- [Version history](#version-history) · [Related drivers](#related-drivers) · [License](#license)
 
 ## Overview
 
@@ -16,7 +54,8 @@ Because the in-box `atdisk`/`atapi` drivers of these systems are tied to their e
   - Any PCI IDE controller (class code `01-01`) in **compatibility mode** (ports 1F0h/3F6h and 170h/376h, IRQ 14 and 15) or **native/enhanced mode** (ports and interrupt from the PCI BARs), including the per-channel mix a controller's programming interface allows
   - **SATA controllers in IDE mode** (class code `01-01` with the SATA vendors' device IDs; Silicon Image 3112/3512/3114/0240 and the ATI IXP 300/400 SATA functions built on the 3112, with class code `01-80` or `01-04`)
   - **Legacy ISA/VLB channels** without a PCI function (1F0h/170h/1E8h/168h, IRQ 14/15/11/10) on NT 3.1–4.0 and 9x; on 2000/XP through the `*PNP0600` device nodes the firmware reports
-  - Up to two channels per adapter instance, two devices per channel; up to 8 controllers per system (build-time, see [Build-time limits](#build-time-limits))
+  - Up to two channels per adapter instance, two devices per channel; up to 32 controllers per system (build-time, see [Build-time limits](#build-time-limits)); channels and single devices can be turned off with `OFF=`
+  - **Compatibility-mode, native-mode and ISA controllers together** on every target; a native-mode function whose BARs the BIOS left on the legacy ports (1F0h/3F4h/170h/374h, where a compatibility-mode function decodes too) is moved to free I/O space before any channel is used (NT 3.1–4.0) or kept off those ports through its PnP resources (2000/XP/x64); see [Several controllers in one machine](#several-controllers-in-one-machine)
   - **Controller timing programmed by the driver**, so the fastest mode is used whatever the BIOS did: Intel PIIX/PIIX3/PIIX4/ICH0–ICH8 (PIO 0–4, MWDMA 0–2, UDMA 0–5 with 80-conductor cable detection), CMD 643/646/648/649 (address setup, active/recovery and UDMA timing; UDMA 2/4/5 as the chip and revision allow, host-side cable detection on the 648/649) and Silicon Image 3112/3512/3114 (transfer mode register in BAR 5)
   - **Every other controller**: the timing is left as the BIOS set it, and DMA is used for a parallel ATA drive only where the BIOS flagged it as DMA-capable in the bus-master status register (the rule Linux's generic driver uses); a SATA drive keeps the UDMA mode the BIOS selected, since a SATA link has no parallel timing; `DMA=1` overrides this; see [Transfer mode selection](#transfer-mode-selection)
   - **Chip errata handled**: the CMD64x interrupt latches (cleared on every interrupt and after every command, otherwise the PCI interrupt line stays asserted), the SiI3112 "mod15write" data corruption with certain Seagate drives (at most 15 sectors per command), the SiI3512/3114 "R_ERR on DMA activate FIS" errata, SiI SATA interrupts (masked), ALi M5229 limits (no 48-bit DMA before revision C5, no ATAPI DMA, no DMA before revision 20), the RZ1000/CMD640 read-ahead FIFO (turned off, channels serialized), ServerWorks OSB4/CSB UDMA limits, the Intel 450NX PIIX4 DMA errata, simplex bus masters (DMA on one channel only); see [Controller-specific handling](#controller-specific-handling)
@@ -35,10 +74,13 @@ Because the in-box `atdisk`/`atapi` drivers of these systems are tied to their e
   - MODE SENSE caching page (08h, WCE/DRA from IDENTIFY word 85) and control page (0Ah); MODE SELECT on the caching page turns the write cache and read look-ahead on and off (SET FEATURES 02h/82h, AAh/55h), kept across resets and power transitions
   - SAT ATA PASS-THROUGH(12)/(16) (non-data, PIO in/out, DMA; CK_COND and "return response information" with descriptor sense)
   - SMART through `IOCTL_SCSI_MINIPORT` ("SCSIDISK" signature, as `atapi.sys`), so `SMART_RCV_DRIVE_DATA` tools work; see [IOCTL interface](#ioctl-interface)
-  - 64-bit SCSI on every target: READ CAPACITY(16) (SERVICE ACTION IN), READ/WRITE/VERIFY(16), SYNCHRONIZE CACHE(16), MODE SENSE(10) long LBA block descriptor (LLBAA); READ CAPACITY(10) returns `0xFFFFFFFF` for disks past 2 TB so the upper layer switches to READ CAPACITY(16)
-  - ATA disks report INQUIRY VERSION `05h` (SPC-3 / SBC-2), advertising 16-byte CDB support; VPD pages `00h` and `80h` (serial number from IDENTIFY)
+  - 64-bit SCSI on every target: READ CAPACITY(16) (SERVICE ACTION IN), READ/WRITE/VERIFY(16), SYNCHRONIZE CACHE(16), MODE SENSE(10) long LBA block descriptor (LLBAA); READ CAPACITY(10) returns `0xFFFFFFFF` for disks of 2 TB and more where the class driver then reads READ CAPACITY(16), and `0xFFFFFFFE` (the first 2 TB) where it cannot (see [Disks of 2 TB and more](#disks-of-2-tb-and-more))
+  - ATA disks report INQUIRY VERSION `05h` (SPC-3 / SBC-2), advertising 16-byte CDB support; VPD pages `00h`, `80h` (serial number from IDENTIFY), `B0h` (block and unmap limits), `B1h` (rotation rate and form factor, IDENTIFY words 217/168) and `B2h` (logical block provisioning)
+  - **UNMAP** as DATA SET MANAGEMENT / TRIM (IDENTIFY word 169) on SATA SSDs behind an IDE-mode controller, when the device runs with bus-master DMA (the command is a DMA command); READ CAPACITY(16) reports LBPME, and LBPRZ for deterministic zeroes after TRIM (word 69); see [TRIM](#trim)
+  - **LOG SENSE** pages `00h`, `0Dh` (temperature from the SMART attributes) and `2Fh` (informational exceptions: ASC 5Dh when SMART RETURN STATUS reports a threshold exceeded)
+  - **TRIM mode** for Windows versions that send no TRIM: with `tools\trimnt.exe` the free space of a volume is trimmed; see [TRIM](#trim)
   - 28-bit READ/WRITE DMA (or READ/WRITE SECTORS under PIO) whenever the request fits; the EXT commands only on devices whose IDENTIFY DEVICE reports the 48-bit Address feature set (word 83, bit 10)
-  - ATAPI (PACKET command) for CD/DVD-class devices, with DMA when the device and the channel support it: TEST UNIT READY / MEDIUM REMOVAL are passed through, REQUEST SENSE returns the drive's own sense data, MODE SENSE(6) is translated to ATAPI MODE SENSE(10) and back — media changes and empty trays are reported correctly to the CD-ROM class driver
+  - ATAPI (PACKET command) for CD/DVD drives and removable ATAPI disks (ZIP, LS-120/SuperDisk, MO; the peripheral device type comes from IDENTIFY PACKET DEVICE), with DMA when the device and the channel support it; READ(6)/WRITE(6) go to the drive as READ(10)/WRITE(10); TEST UNIT READY / MEDIUM REMOVAL are passed through, REQUEST SENSE returns the drive's own sense data, MODE SENSE(6) is translated to ATAPI MODE SENSE(10) and back — media changes and empty trays are reported correctly to the CD-ROM class driver
   - A unit that did not answer IDENTIFY DEVICE / IDENTIFY PACKET DEVICE is reported as empty (`SRB_STATUS_NO_DEVICE`), never as a zero-length disk; a channel or a controller without any device presents no targets, and the OS boots on
   - Logical sector sizes of 512, 1024, 2048 and 4096 bytes (IDENTIFY word 106 / words 117–118): READ CAPACITY(10)/(16) and MODE SENSE report the drive's own block length, READ CAPACITY(16) also the logical-per-physical exponent (512e drives); see [Logical sector size](#logical-sector-size)
 
@@ -50,7 +92,7 @@ Because the in-box `atdisk`/`atapi` drivers of these systems are tied to their e
 
 - **Interrupt-driven DMA with a watchdog** — disk reads and writes go out as DMA commands and complete from `HwInterrupt`; a 100 ms timer checks the channels while a command is outstanding, and after five completions that no interrupt reported the driver turns the interrupt path off and continues with Fast Polling for good; see [I/O model](#io-model)
 
-- **Power management** — flush and standby on shutdown and on power transitions, `HwAdapterControl` (stop/restart) on 2000/XP, hibernation and crash dump support, re-initialization of a channel whose controller lost its state, and a power-down/up IOCTL for an ACPI driver on NT 3.1–4.0 and 9x; see [Power management](#power-management)
+- **Power management** — flush on shutdown (standby too with `STANDBY=1`), flush and standby on power transitions, `HwAdapterControl` (stop/restart) on 2000/XP, hibernation and crash dump support, re-initialization of a channel whose controller lost its state, and a power-down/up IOCTL for an ACPI driver on NT 3.1–4.0 and 9x; see [Power management](#power-management)
 
 ## Architecture
 
@@ -78,8 +120,9 @@ Because the in-box `atdisk`/`atapi` drivers of these systems are tied to their e
 | `src\idemain.c` | `DriverEntry`, `HwFindAdapter` (PCI scan, PnP resources, legacy channels), channel bring-up, `HwStartIo`, `HwInterrupt`, the watchdog timer, `HwResetBus`, `HwAdapterControl`, NT 3.1 compatibility |
 | `src\idecmd.c` | Command execution: task-file programming, PIO data transfer, PRD building and bus-master DMA, transfer mode selection, Intel timing registers, channel reset, DMA fallback and self-healing |
 | `src\idesatl.c` | SCSI-to-ATA translation, IDENTIFY parsing, ATAPI, sense data, MODE SENSE/SELECT, pass-through, SMART and power IOCTLs |
-| `src\idepnp.c` | 2000/XP/x64 only: the start-device hook that adds IRQ 14 for a compatibility-mode PCI function (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics)) |
+| `src\idepnp.c` | 2000/XP/x64 only: the PnP hook that connects IRQ 14 for a compatibility-mode PCI function and keeps a native-mode function off the legacy ports (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics)) |
 | `src\NT`, `src\2KXP`, `src\9X` | Build files per target |
+| `tools\portpage.c`, `tools\mkpp.sh` | The Device Manager page `identpp.dll` for 2000/XP/x64 (see [Device Manager page](#device-manager-page)); the same source builds the page of AHCINT, IDENT, NVMENT and MMCSDNT |
 | `bin\` | Prebuilt binaries and install files |
 
 ## Feature matrix by target
@@ -118,17 +161,20 @@ Because the in-box `atdisk`/`atapi` drivers of these systems are tied to their e
 - One command at a time per channel (ATA has no queuing outside NCQ, which IDE-mode controllers do not expose); ScsiPort is told one request per LU
 - 128 KB maximum transfer size per request (32 physical breaks)
 - No hot-plug support on any target; devices are detected at `HwInitialize` and again after a power transition or reset
-- No link power management or spin-down timers; disks are spun down with STANDBY IMMEDIATE only on shutdown, power-down and START STOP UNIT
+- No link power management or spin-down timers; disks are spun down with STANDBY IMMEDIATE only on power-down, START STOP UNIT and (with `STANDBY=1`) shutdown
 - Controller timing is programmed on Intel PIIX/ICH, CMD64x and Silicon Image 311x only. On other chipsets (VIA, AMD, nVidia, SiS, ALi, ServerWorks, HighPoint, Promise, ...) the driver relies on the BIOS for the host side: a parallel drive the BIOS did not flag for DMA runs with PIO (`DMA=1` overrides this, `DMA=0` turns DMA off). An add-in card whose own BIOS is disabled therefore runs its parallel drives with PIO unless `DMA=1` is given
 - The chip-specific code (CMD64x latches and timing, Silicon Image BAR 5, the ALi/ServerWorks/RZ1000/CMD640/450NX errata) was verified against QEMU models of these chips (see `TESTS.TXT`), not on the real controllers; the lists of affected drives and revisions follow Linux. Reports from real hardware are welcome
 - Windows 9x: the CMD 643/646 run with Fast Polling (their interrupt latches are in configuration space)
 - NT 3.x/4.0: after a text-mode installation the in-box IDE drivers are turned off by the driver at its first start, so that boot may still find some channels held by `atapi`/`atdisk`; from the next boot IDENT has them
 - Windows 2000/XP: installing IDENT turns `atapi` off for every IDE controller (see [In-box IDE drivers](#in-box-ide-drivers)); a controller left on Windows' driver loses its drives at the next boot
 - Silicon Image 3114: channels 3 and 4 have no I/O BARs and are not used; channels 1 and 2 work
+- Windows 9x does not move a native-mode function that the BIOS left on the legacy ports (see [Several controllers in one machine](#several-controllers-in-one-machine)); on such a machine (QEMU with SeaBIOS and a second, native IDE controller) the compatibility-mode drives on the shared ports stay hidden, as they are for the BIOS itself
+- 2000/XP/x64: hibernation and resume with a native-mode function moved off the legacy ports have not been tested; the BIOS puts the old addresses back at power-on, and `pci.sys` restores the assigned ones when the function powers up
+- Moving a native-mode function off the legacy ports on NT 3.1–4.0: the free block is chosen from what the PCI BARs and bridge windows show; I/O that a chipset decodes through its own registers (ACPI, SMBus and GPIO bases) is not visible there, which is why the search stays next to the function's bus-master block and at or above 1000h. Tested on QEMU's PIIX3 and CMD646, not on real hardware
 - Simplex bus masters: only the primary channel uses DMA, even when it has no drives
 - Memory above 4 GB: tested on XP x64 with 2 GB of the RAM above the 4 GB line (all transfers correct, including PIO into buffers there; XP x64's ScsiPort hands the 32-bit bus master buffers below 4 GB). Windows 2000 with `/PAE` was run on Professional only, which uses no memory above 4 GB; Advanced Server/Datacenter with more than 4 GB has not been tested
 - SMART through the "SCSIDISK" IOCTL reaches only the first device of a channel (LUN 0); the second device is reached with ATA PASS-THROUGH
-- Disks past 2 TB need an upper layer that issues 16-byte CDBs (e.g. LBA64HLP.VXD on Windows 9x); the driver answers them on every target
+- Disks of 2 TB and more: Windows 9x, NT 3.1–4.0, 2000 and XP x86 address at most the first 2 TB (their class drivers know only READ CAPACITY(10) and 32-bit LBAs); XP x64 and Server 2003 SP1 and later see the whole disk. See [Disks of 2 TB and more](#disks-of-2-tb-and-more)
 - Logical sectors larger than 4096 bytes are not taken (the device is left unusable); CHS-only devices (no LBA) are not addressable
 - A disk with logical sectors larger than 512 bytes works as a data disk only: BIOS INT 13h and the boot loaders read 512-byte sectors, so the system cannot boot from it (NTLDR hangs or reports `ntoskrnl.exe` missing)
 - 9X and NT builds do not fill auto-sense; the OS-era class drivers issue their own REQUEST SENSE
@@ -222,6 +268,10 @@ Output: `ident.sys` under the amd64 output directory (`objfre_wnet_amd64\amd64\`
 
 > The 2000/XP and x64 builds should first be verified in the **checked** build environment before being rebuilt and shipped from the **free** build environment.
 
+#### Device Manager page (2000/XP/x64)
+
+`tools\mkpp.sh` builds `identpp.dll` (and the pages of the sibling drivers) from `tools\portpage.c` with MinGW-w64, x86 into `pp\i386` and x64 into `pp\amd64`. The DLL uses no C runtime: it imports only `kernel32`, `user32`, `advapi32`, `setupapi` and `comctl32` functions that Windows 2000 has.
+
 ## Installation
 
 ### Installation Media
@@ -277,6 +327,8 @@ The in-box INFs match on `PCI\VEN_xxxx&DEV_xxxx` (a compatible ID) or on `PCI\CC
 
 A chip that an in-box INF names by `VEN&DEV` but that is missing from IDENT's chip list keeps the in-box driver; install IDENT on it with **Update Driver → Have Disk** and pick it from the list. On Windows 95/98/Me the INF is of class `hdc` so that it is offered for an `hdc`-class device; a plain `VEN&DEV` list for the same chips is included for Windows 95 RTM, which does not always generate class-code IDs.
 
+Every `bin\2KXP` folder also holds `identpp.dll`, the [Device Manager page](#device-manager-page): the x86 build in `2KXP\`, `i386\` and `floppy_i386\`, the x64 build in `amd64\` and `floppy_amd64\`. `ident.inf` copies it into `System32` and registers it (`EnumPropPages32`); `txtsetup.oem` lists it as a `dll` so that it is on the F6 disk's way into `OemDir` as well. Without it the driver works as before, only the tab is missing.
+
 ### Installing
 
 #### Windows 95 / 98 / Me
@@ -309,6 +361,8 @@ Two drivers must not both own the same channel: the ports of a channel are regis
 
 **Disk class driver:** NT 3.x's `scsidisk` (NT 4.0: `disk`) must be a boot driver (`Start = 0`) like the miniport. Otherwise NTLDR does not load it and a system disk on IDENT stops with `0x7B INACCESSIBLE_BOOT_DEVICE`. Text-mode setup sets this when it installs onto a SCSI disk; `oemsetup.inf` sets it too (`Start = 0` for `scsidisk`, or `disk` where there is no `scsidisk`) when the driver is added through *Windows NT Setup* / *SCSI Adapters*. When moving an existing installation onto IDENT by hand, set `HKLM\SYSTEM\CurrentControlSet\Services\scsidisk\Start` (NT 4.0: `...\disk\Start`) to `0` first, and `IDENT`'s own `Start` to `0`.
 
+**CD-ROM drives:** they need the CD-ROM class driver (`scsicdrm` on NT 3.x, `cdrom` on NT 4.0) and CDFS. NT 3.1 supports no IDE CD-ROM drive, so an NT 3.1 installed on IDE (`atdisk`) leaves `scsicdrm` and `cdfs` at `Start = 4`, and a CD-ROM drive on IDENT gets no `\Device\CdRom0` and no drive letter in File Manager. `oemsetup.inf` sets them to `1` (system) when they are at `4`, and so does the driver at boot when it has found a CD-ROM drive (also after a text-mode installation); `cdfs` is left alone when a file system recognizer that loads it is enabled (`cdfs_rec` on NT 3.x, `fs_rec` on NT 4.0). When the driver does it, the drive appears in the same boot. An installation whose `system32\drivers` lacks `SCSICDRM.SYS` and `CDFS.SYS` (or whose `Services` key lacks their entries) needs them from the NT 3.1 CD's `I386` folder first (a compressed file there ends in `_` and is unpacked with `expand`).
+
 ### In-box IDE drivers
 
 IDENT takes the place of the IDE drivers Windows brings, so installing it turns those off:
@@ -320,7 +374,7 @@ IDENT takes the place of the IDE drivers Windows brings, so installing it turns 
 | 95 / 98 / Me | `IDENT9X.INF` | — | — |
 
 - **2000/XP:** every IDE controller should run with IDENT before the reboot that follows. A second IDE controller still on Windows' driver (installed before, and not switched with Update Driver) loses its drives with `atapi` off. The INF's hardware ID ranking makes IDENT the driver Windows picks for an IDE controller it detects anew.
-- **NT 3.x/4.0:** the class driver (`scsidisk`/`disk`) is made a boot driver at the same time (see [Windows NT 3.1 / 3.50 / 3.51 / NT 4.0](#windows-nt-31--350--351--nt-40)).
+- **NT 3.x/4.0:** the class driver (`scsidisk`/`disk`) is made a boot driver at the same time (see [Windows NT 3.1 / 3.50 / 3.51 / NT 4.0](#windows-nt-31--350--351--nt-40)), and the CD-ROM class driver and CDFS are turned on when they are off (`scsicdrm`/`cdrom`, `cdfs`: `Start` 4 → 1).
 - **NT 3.x/4.0 text-mode setup:** the `[Config]` values of `txtsetup.oem` are written under IDENT's own service key only, so the file cannot reach `atdisk` or `atapi`. The driver takes over: once its `HwFindAdapter` has found a controller (also when the adapter is then refused because an in-box driver holds the ports), it saves each in-box driver's `Start` as `InboxStart_<name>` and sets it to `4`, and makes the disk class driver (`scsidisk`, or `disk` on NT 4.0) a boot driver when it turned one off; this takes effect at the next boot. It happens once per driver: an in-box driver whose `InboxStart_<name>` is already there (saved by `oemsetup.inf` or by an earlier start) is not touched again, so one turned back on by hand stays on. Removing IDENT through *SCSI Adapters* puts the saved values back as after an `oemsetup.inf` installation.
 - **Windows 9x** has no single switch for its IDE driver: `ESDI_506.PDR` reads its settings (including `NoIDE`) from each IDE controller's own device node. Installing IDENT9X on a controller replaces `ESDI_506.PDR` as that controller's port driver and removes its two channel device nodes, so `ESDI_506.PDR` no longer touches it. A controller left on Windows' driver keeps `ESDI_506.PDR`; it is a different piece of hardware, so the two never compete for a channel.
 
@@ -345,11 +399,28 @@ On the NT family the driver reads the ScsiPort argument string, the `REG_SZ` val
 | `DMA=0` | No bus-master DMA: every device runs under PIO (the host timing is still set on Intel controllers) |
 | `DMA=1` | Use UDMA/MWDMA on an unknown (non-Intel) controller even when the BIOS left the drive without DMA; the device's fastest mode is set, UDMA above 2 only with an 80-conductor cable |
 | `IRQ=0` | No interrupt: every command is Fast Polling. Use this on a machine whose IDE interrupt routing is wrong (the watchdog would get there on its own after five missed interrupts) |
+| `STANDBY=1` | STANDBY IMMEDIATE after the flush at system shutdown (see [Power management](#power-management)) |
+| `OFF=list` | Channels and devices the driver leaves alone, separated by commas: `c` a whole channel (0 primary, 1 secondary), `c.u` one device (0 master, 1 slave): `OFF=1,0.1` turns off the secondary channel and the primary slave of every controller; a PCI location `bus.device.function:` in front (decimal, as Device Manager shows it) limits an item to one controller: `OFF=0.31.1:1`. A device turned off gets no command (the reset of its channel still reaches it); a channel turned off is not reset and gets no command, and on NT 3.1–4.0 no adapter either, so its ports stay free for another driver |
+| `RC16=1` / `RC16=0` | READ CAPACITY(10) reports `FFFFFFFFh` for a disk of 2 TB or more (`RC16=1`, for a class driver or filter that then reads READ CAPACITY(16)), or `FFFFFFFEh` (`RC16=0`); the default depends on the Windows version, see [Disks of 2 TB and more](#disks-of-2-tb-and-more) |
+| `TRIM=0` | No UNMAP and no TRIM mode: VPD B2h and READ CAPACITY(16) report no logical block provisioning |
+| `NATIVEFIRST=1` | NT 3.1–4.0: channels in native mode get the first adapters, and with them the first disk numbers; the compatibility-mode and ISA channels follow. For NT 3.1 booting from a native-mode controller while a compatibility-mode controller has drives too (see [Windows NT 3.1 specifics](#windows-nt-31-specifics)); on NT 3.50–4.0, which find the boot disk by its signature, it keeps the system partition at `C:` when no drive letters were saved with Disk Administrator (letters then follow the disk order) |
 | `IRQ=1` | Windows 9x: connect the device node's interrupt and use interrupt-driven DMA (Fast Polling by default there). Windows NT 3.1: also connect the INTx line of a native-mode PCI function (compatibility-mode and ISA channels use IRQ 14/15 without it); see [Windows NT 3.1 specifics](#windows-nt-31-specifics) and [Windows 9x specifics](#windows-9x-specifics) |
 
 Several values are separated by spaces or semicolons.
 
 On Windows 95/98/Me `SCSIPORT.PDR` passes the string value `AdapterSettings` of the controller's driver key as the argument string. The key is `HKLM\System\CurrentControlSet\Services\Class\hdc\000n` (the one whose `PortDriver` is `IDENT9X.MPD`; Device Manager's controller properties show which); add `"AdapterSettings"="IRQ=1"` there, for example with a `.reg` file, and restart.
+
+### Device Manager page
+
+On Windows 2000, XP and Server 2003 (x86 and x64) the controller's properties in Device Manager have a **Channels** tab (`identpp.dll`):
+
+- The list shows the primary and secondary channel of the controller with their I/O ports, and under each the master and slave device (vendor and product from the inquiry data, or `(no device)`); one turned off at boot is listed as `(turned off)`.
+- Clearing a check box turns that channel or device off: the page writes an `OFF=` item with the controller's PCI location (`bus.device.function:item`) into `DriverParameters`; checking it again removes the item. An `OFF=` item without a location (for every controller) that this controller should no longer follow is replaced by items for each of the other IDENT controllers, so they keep it. A channel row turns off the whole channel (`c`), a device row one device (`c.u`).
+- The box under the list shows the whole `DriverParameters` string, for all controllers; it can be edited directly (other values, items the list does not show), and the check boxes follow it.
+- **OK** or **Apply** stores the string. Device Manager then restarts the controller, which takes effect at once for a controller without the system disk, page file or hibernation file, or asks for a restart of the computer.
+- Writing the value needs administrator rights (it is under `HKLM`).
+
+NT 3.1–4.0 have no Device Manager: there `OFF=` goes into the registry by hand, as above. On Windows 9x/Me it goes into `AdapterSettings`.
 
 ### Build-time limits
 
@@ -358,7 +429,7 @@ The limits are compile-time constants in `src\ident.h`:
 ```c
 #define IDE_MAX_CHANNELS                2           /* per adapter instance */
 #define IDE_DEVICES_PER_CHANNEL         2
-#define IDE_MAX_CONTROLLERS             8
+#define IDE_MAX_CONTROLLERS             32
 #define IDE_MAX_TRANSFER                0x20000     /* 128 KB */
 #define IDE_MAX_PHYS_BREAKS             32
 #define IDE_PRD_ENTRIES                 64
@@ -367,7 +438,7 @@ The limits are compile-time constants in `src\ident.h`:
 ```
 
 - **`IDE_MAX_CHANNELS`** and **`IDE_DEVICES_PER_CHANNEL`** follow the hardware (a PCI IDE function has two channels of two devices) and size the device extension and the DMA arena; the target ID of a device is `channel × 2 + unit`, and `InitiatorBusId` is set one past the last target. They are not meant to be changed
-- **`IDE_MAX_CONTROLLERS`** sizes the table that records which channels (by command port) a driver instance has claimed, so that two instances never drive the same channel. Keep it at or above the number of IDE channels in the machine; a `DEBUG=1`/checked build logs when the table is full
+- **`IDE_MAX_CONTROLLERS`** sizes the table that records which channels (by command port) a driver instance has claimed, so that two instances never drive the same channel (two entries per controller plus the four legacy channels, 8 bytes each; 8 controllers up to the first 1.1.0.0 build). Keep it at or above the number of IDE controllers in the machine; a `DEBUG=1`/checked build logs when the table is full
 - **`IDE_MAX_TRANSFER`** and **`IDE_MAX_PHYS_BREAKS`** are what ScsiPort is told; `IDE_PRD_ENTRIES` (64, a 512-byte table that never crosses a 64 KB boundary) leaves room for a PRD split at a 64 KB boundary of every one of the 33 pages a 128 KB request can touch
 - **`IDE_MISSED_IRQ_LIMIT`** and **`IDE_DMA_ERROR_LIMIT`** set when the driver gives up on interrupts (per adapter) and on DMA (per device)
 
@@ -435,7 +506,7 @@ IDE_DBG((IDE_PFX "Channel %lu.%lu: status %02lX\n", channel, unit, status));
 
 ### Power management
 
-- **Shutdown and flush:** `SRB_FUNCTION_SHUTDOWN` and `SRB_FUNCTION_FLUSH` issue FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present). SYNCHRONIZE CACHE does the same for one disk.
+- **Shutdown and flush:** `SRB_FUNCTION_FLUSH` issues FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present); SYNCHRONIZE CACHE does the same for one disk. `SRB_FUNCTION_SHUTDOWN` flushes every disk of the target; with `STANDBY=1` it then sends STANDBY IMMEDIATE, so the disk parks its heads (or an SSD saves its tables) before the power goes instead of an emergency power-off. Off by default, as in AHCINT 1.6.0.0: a hang at shutdown on XP x64 was reported with AHCINT 1.5.0.0, which spun the disks down there. The driver declares `CachesData`, without which ScsiPort passes neither request.
 - **START STOP UNIT:** stop = flush, then STANDBY IMMEDIATE; start = IDLE IMMEDIATE. The next read or write spins the disk up again.
 - **Windows 2000/XP/x64 — `HwAdapterControl`:** `ScsiStopAdapter` (sleep, hibernation, device removal) flushes and puts the disks in standby, disables the device interrupts and stops the bus masters; `ScsiRestartAdapter` sets the channels up again: reset, IDENTIFY, transfer modes, the MODE SELECT settings (write cache, look-ahead).
 - **Hibernation and crash dump (2000/XP/x64):** the dump stack loads the miniport a second time without a driver object (or with `DUMP=` in the argument string). That instance uses Fast Polling only and keeps its device extension small; it finds the channel to use from the resources the dump stack hands it, or, for a compatibility-mode function, from the IRQ (14 = primary, 15 = secondary) and the function's PCI header (tested with the system disk in compatibility mode).
@@ -448,12 +519,19 @@ Both are `IOCTL_SCSI_MINIPORT` requests (an `SRB_IO_CONTROL` header followed by 
 
 | Signature | ControlCode | Function |
 |---|---|---|
-| `"IDENT   "` | `1` GET_INFO | Returns `IDE_IOCTL_INFO`: driver version (`01000000h`), flags (bit 0 interrupt path active, bit 1 powered down, bit 2 bus master present), channel count, PCI vendor/device (0 for a legacy channel), per channel the command and bus-master ports, IRQ and native flag, per device the transfer mode (`00h` PIO, `10h` MWDMA, `20h` UDMA plus the mode number in bits 3:0, bit 7 set for ATAPI, `FFh` no device) and DMA error count, and the interrupt count |
+| `"IDENT   "` | `1` GET_INFO | Returns `IDE_IOCTL_INFO`: driver version (`01010000h`), flags (bit 0 interrupt path active, bit 1 powered down, bit 2 bus master present, bit 3 TRIM mode), channel count, PCI vendor/device (0 for a legacy channel), per channel the command and bus-master ports, IRQ and native flag, per device the transfer mode (`00h` PIO, `10h` MWDMA, `20h` UDMA plus the mode number in bits 3:0, bit 7 set for ATAPI, `FFh` no device) and DMA error count, and the interrupt count |
 | `"IDENT   "` | `10h` POWER_DOWN | Flush, STANDBY IMMEDIATE on every disk, stop the bus masters, disable the device interrupts. GET_INFO does not wake the controller; any other request does |
 | `"IDENT   "` | `11h` POWER_UP | Set the channels up again (as after `ScsiRestartAdapter`) |
+| `"IDENT   "` | `20h` TRIM_MODE_ON | A 4 KB pattern follows the header: from now on a write whose data is that pattern repeated is not written but trimmed (see [TRIM](#trim)) |
+| `"IDENT   "` | `21h` TRIM_MODE_OFF | Back to normal writes |
 | `"SCSIDISK"` | `1B0500h`–`1B050Ch` | SMART, as `IOCTL_SCSI_MINIPORT_SMART_VERSION` ... `_WRITE_LOG` (`NTDDSCSI.H`): IDENTIFY, READ ATTRIBUTES/THRESHOLDS, ENABLE/DISABLE, RETURN STATUS, AUTOSAVE, SAVE ATTRIBUTES, OFFLINE DIAGS, READ/WRITE LOG. `bDriveNumber` is the channel; the device map in SMART_VERSION follows `atapi.sys` (bit n ATA, bit n+4 ATAPI) |
 
 The structures are in `src\ident.h` (`IDE_SRB_IO_CONTROL`, `IDE_IOCTL_INFO`, `IDE_SENDCMD_IN/OUT`).
+
+### TRIM
+
+- **UNMAP:** every block descriptor becomes TRIM ranges of DATA SET MANAGEMENT (06h, 48-bit DMA, up to 65535 blocks per range, 64 ranges per 512-byte block), issued through the channel's bounce buffer. Offered only on devices whose IDENTIFY word 169 bit 0 reports TRIM and that run with bus-master DMA (not with `DMA=0`); VPD B0h gives 64 descriptors and the maximum LBA count, VPD B2h LBPU. LBPRZ (zeroes after TRIM) follows IDENTIFY word 69 bits 14 and 5.
+- **TRIM mode:** Windows versions before 7 never send TRIM. `TRIM_MODE_ON` gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated over the whole request is trimmed instead of written. `tools\trimnt.exe <drive letter>` switches the mode on with a random pattern on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, fills the free space of the volume with files of the pattern (unbuffered, write-through), switches the mode off and deletes the files. Other writes are written normally all the time.
 
 ### ATA command selection
 
@@ -474,7 +552,7 @@ What the operating system does with such a disk is up to its class and file syst
 - **One adapter per PCI function:** `SCSIPORT.PDR` calls `HwFindAdapter` once per device node, so the function's two channels are one adapter (targets 0–1 on the primary, 2–3 on the secondary); the in-box driver's two "channel" device nodes disappear with it.
 - **Fast Polling by default:** `SCSIPORT.PDR` connects the single interrupt the device node carries; on a compatibility-mode function that is IRQ 14 only, and the IOS layers above do not expect a miniport to take long per request anyway. `IRQ=1` in `AdapterSettings` (see [Driver parameters](#driver-parameters)) turns the interrupt path on for the channel whose IRQ was connected: on a native-mode controller that is the function's PCI interrupt, shared by both channels.
 - **`HwAdapterState`:** `SCSIPORT.PDR` calls this for PCI miniports during Plug and Play state changes; the 9X build provides it, because leaving it `NULL` makes `SCSIPORT.PDR` report "Init Failure" for the miniport. A restore makes the next request check whether the controller lost its state.
-- **PCI discovery:** the bus:slot `SCSIPORT.PDR` hands in is tried first, then a PCI bus scan through the BIOS-independent `CF8h`/`CFCh` mechanism.
+- **PCI discovery:** the bus:slot `SCSIPORT.PDR` hands in is tried first. `SCSIPORT.PDR` reads only the device node's own configuration space, so the other PCI functions (the bus scan) are read through configuration mechanism #1 (`CF8h`/`CFCh`).
 - **Install:** the INF is of class `hdc` and lists the in-box chips by `VEN&DEV` too, see [Hardware IDs](#hardware-ids) and [Windows 95 / 98 / Me](#windows-95--98--me).
 
 ### Windows NT 3.1 specifics
@@ -486,21 +564,44 @@ NT 3.1's ScsiPort and HAL predate PCI support in non-PnP miniports. The NT build
 - **`PORT_CONFIGURATION_INFORMATION`:** 58h bytes on NT 3.1, without `SlotNumber` and `MaximumNumberOfTargets` (the access ranges follow right after it). The driver checks `ConfigInfo->Length` before touching those fields.
 - **DMA:** the bus master needs 32-bit physical addresses, and NT 3.1's HAL gives an ISA adapter map registers below 16 MB and bounces everything through them. The driver therefore reports `Eisa` as the interface type of a channel with a bus master; the HAL gives a scatter/gather master on EISA no map registers, and the controller sees real physical addresses. A plain ISA channel (no bus master, PIO only) is reported as `Isa`.
 - **Interrupt:** a compatibility-mode or ISA channel reports its IRQ (14/15/11/10, edge) on the EISA or ISA bus and is interrupt-driven as on NT 4.0. NT 3.1 has no PCI bus handler, so a native-mode function's INTx line (level-sensitive, from config space) cannot be connected on `PCIBus`; by default such a channel reports no interrupt (level 0) and uses Fast Polling. With `IRQ=1` in `DriverParameters` the INTx line is reported on the EISA bus and the interrupt path is used; if those interrupts do not arrive, the watchdog goes back to Fast Polling. It stays opt-in because a failed interrupt connection on NT 3.1 fails the whole adapter, and with it the boot.
-- **Disk numbering:** NT 3.1 numbers the disks in the order their drivers load and resolves `multi(0)disk(0)rdisk(n)` by that order. IDENT's `Tag` (40) loads it ahead of an untagged SCSI miniport, so with the system disk on another miniport (AHCINT, say) and IDENT added for data disks, IDENT's first disk becomes `rdisk(0)` and the system does not come up (0x7B, or it runs on the wrong partition and stops). Then remove IDENT's `Tag` value or give it one that orders it behind the other miniport, or point `boot.ini` at the right `rdisk(n)`. (Seen on NT 3.1; NT 4.0 identifies the boot disk by its signature.)
+- **Disk numbering:** NT 3.1 numbers the disks in the order their drivers load (and, within IDENT, in the order of its adapters: PCI functions by bus, device and function, primary channel before secondary, then the ISA channels) and resolves `multi(0)disk(0)rdisk(n)` by that order, while NTLDR reads `rdisk(n)` as BIOS drive 80h+n. When the system disk is on a native-mode controller and a compatibility-mode controller earlier on the bus has drives too (an Intel PATA function at 00:1F.1 and the SATA function at 00:1F.2 in native mode, for example), the two orders differ and NT 3.1 does not come up; `NATIVEFIRST=1` in `DriverParameters` puts the native-mode channels first, so the BIOS boot drive (80h) is IDENT's first disk again. Set it before moving the system disk, for example from the running system. IDENT's `Tag` (40) loads it ahead of an untagged SCSI miniport, so with the system disk on another miniport (AHCINT, say) and IDENT added for data disks, IDENT's first disk becomes `rdisk(0)` and the system does not come up (0x7B, or it runs on the wrong partition and stops). Then remove IDENT's `Tag` value or give it one that orders it behind the other miniport, or point `boot.ini` at the right `rdisk(n)`. (Seen on NT 3.1; NT 4.0 identifies the boot disk by its signature.)
+- **CD-ROM drives:** NT 3.1 itself has CD-ROM support for SCSI drives only, so an installation on IDE has the CD-ROM class driver and CDFS turned off. IDENT turns them on (see [Windows NT 3.1 / 3.50 / 3.51 / NT 4.0](#windows-nt-31--350--351--nt-40)).
 - **Several channels:** each channel asks to be called again (`*Again = TRUE`); the next call takes the next unclaimed channel: the other channel of the same function, the next PCI IDE function, then the legacy ports 1F0h/170h/1E8h/168h that no PCI function decodes.
 
 ### Windows NT 4.0 (and 3.50/3.51) specifics
 
 - **One adapter per channel:** every channel is its own ScsiPort adapter with its own interrupt (IRQ 14, IRQ 15, or the function's INTx twice for a native-mode controller, which ScsiPort shares), so both channels of a compatibility-mode function are interrupt-driven.
 - **Two passes:** `DriverEntry` calls `ScsiPortInitialize` for `PCIBus` (the PCI functions, bus master channels on the `Eisa` bus handler for 32-bit DMA) and again for `Isa` (the legacy ports no PCI function decodes). Channels found in the PCI pass are recorded by command port so the ISA pass skips them.
+- **Interrupt check:** before reporting a channel's interrupt (IRQ 14/15, or a native-mode function's INTx) the driver asks the HAL for a vector (`HalGetInterruptVector`, as ScsiPort will). An MPS HAL (`halmps.dll`) whose MP table has no entry for that interrupt returns none, and ScsiPort would then fail the adapter (`0x7B` with the system disk on it; see AHCINT's GitHub issue #2). The channel then runs with Fast Polling; the debug output says `no vector for IRQ n ... Fast Polling`.
 - **`atdisk`/`atapi`:** ScsiPort registers each adapter's access ranges with the I/O manager (`IoReportResourceUsage`); a channel whose ports an in-box driver that loaded earlier already registered is rejected as a resource conflict, and the in-box driver keeps it. Disable the in-box driver (`Start = 4`) when IDENT is to own the channel.
+
+### Disks of 2 TB and more
+
+A disk whose last LBA is `FFFFFFFFh` or beyond does not fit READ CAPACITY(10). The SCSI answer is `FFFFFFFFh`, which tells the class driver to read READ CAPACITY(16). The disk class drivers of Server 2003 SP1 and XP x64 (and later) do; those of NT 3.1–4.0, Windows 9x, 2000 and XP x86 do not: they add one to the value in 32 bits and see a disk of 0 bytes. The driver therefore answers `FFFFFFFEh` (2 TB minus one sector) where the class driver does not know READ CAPACITY(16): those systems see and use the first 2 TB, which is all they can address with READ(10)/WRITE(10) and an MBR anyway. READ CAPACITY(16) and 16-byte CDBs always give the whole disk.
+
+The choice is made once at load time: the NT and 9x builds always clip; the 2000/XP x86 build asks `PsGetVersion` (Server 2003 with a service pack, or later, reads READ CAPACITY(16)); the x64 build never clips. `RC16=1` / `RC16=0` in `DriverParameters` override it (for example `RC16=1` on 9x with a layer such as LBA64HLP.VXD that reads READ CAPACITY(16) itself).
 
 ### Windows 2000/XP/x64 specifics
 
 - **PnP adapter:** the PCI bus driver enumerates the IDE function and ScsiPort starts IDENT with the function's resources. A **native-mode** function carries its five port ranges (BAR 0–4) and its PCI interrupt (level-sensitive, shareable, whatever IRQ the firmware routed it to) in the resource list; the start-device hook below leaves such a list alone, and the two channels become one adapter with one shared, interrupt-driven line.
-- **Compatibility mode and the missing interrupt:** for a function in compatibility mode `pci.sys` reports only the bus-master port range (BAR 4) and the legacy ports as device-private data; the channels raise ISA IRQ 14 and 15, which are not PCI resources and are not reported. ScsiPort (`scsiport.sys`) refuses to start a PCI adapter whose resource list has no interrupt descriptor (`IRP_MN_START_DEVICE` fails with `IO_ERR_INCORRECT_IRQL`, Device Manager code 10), and connects only the *first* interrupt of a PnP adapter. `DriverEntry` therefore installs a front end on the driver object's `IRP_MJ_PNP` entry after `ScsiPortInitialize` (`src\idepnp.c`): on `IRP_MN_START_DEVICE` with a resource list that has no interrupt and at most one port range (the bus master, BAR 4 — what a compatibility-mode function gets), it appends IRQ 14 (raw: level/vector 14; translated: what `HalGetInterruptVector(Isa, 0, 14, 14)` returns) to copies of both resource lists and passes the IRP on. ScsiPort then connects IRQ 14 for the adapter: the primary channel is interrupt-driven, the secondary channel runs with Fast Polling. The copies are kept until `IRP_MN_REMOVE_DEVICE`. No legacy (`Isa`) detection pass is run on 2000/XP: a non-PnP adapter makes Windows refuse S1–S4, and legacy ISA controllers arrive as `*PNP0600` device nodes anyway.
+- **Compatibility mode and the missing interrupt:** for a function in compatibility mode `pci.sys` reports only the bus-master port range (BAR 4), any further BAR the function has, and the legacy ports as device-private data; the channels raise ISA IRQ 14 and 15, which are not PCI resources and are not reported. ScsiPort (`scsiport.sys`) refuses to start a PCI adapter whose resource list has no interrupt descriptor (`IRP_MN_START_DEVICE` fails with `IO_ERR_INCORRECT_IRQL`, Device Manager code 10), and connects only the *first* interrupt of a PnP adapter. `DriverEntry` therefore installs a front end on the driver object's `IRP_MJ_PNP` entry after `ScsiPortInitialize` (`src\idepnp.c`): on `IRP_MN_START_DEVICE` with a resource list that has no command block of its own (no 8-byte port range: no channel in native mode), it puts IRQ 14 (raw: level/vector 14; translated: what `HalGetInterruptVector(Isa, 0, 14, 14)` returns) into copies of both resource lists, in place of a PCI interrupt the firmware may have given the function (which its channels do not raise), and passes the IRP on. ScsiPort then connects IRQ 14 for the adapter: the primary channel is interrupt-driven, the secondary channel runs with Fast Polling. The copies are kept until `IRP_MN_REMOVE_DEVICE`. No legacy (`Isa`) detection pass is run on 2000/XP: a non-PnP adapter makes Windows refuse S1–S4, and legacy ISA controllers arrive as `*PNP0600` device nodes anyway.
+- **One channel of each mode:** a function with one channel in compatibility mode and one in native mode gets its PCI interrupt; the native channel is interrupt-driven with it and the compatibility-mode channel uses Fast Polling.
+- **Native-mode function on the legacy ports:** see [Several controllers in one machine](#several-controllers-in-one-machine).
 - **Hibernation:** works with the system disk on IDENT in compatibility mode (tested): the dump instance finds its channel from the IRQ the dump stack hands it (14 = primary, 15 = secondary) and the function's PCI header. For a native-mode function it takes the channel from the port resources it is handed; that path has not been tested with hibernation. S3/S4 need every device on the machine to agree; a VGA adapter without a driver (VgaSave) vetoes them, which has nothing to do with IDENT.
 - **Text-mode setup (F6):** the setup kernel boots with a bare `IDENT` service key; the `[Config.scsi.IDENT]` values of `txtsetup.oem` are written only to the installed system. Without `Parameters\PnpInterface\5`, the XP x64 / Server 2003 x64 ScsiPort fails `IRP_MN_START_DEVICE` before `HwFindAdapter` is called, so setup stops with STOP 0x7B (the x86 ScsiPort tolerates the missing value). `DriverEntry` therefore creates `Parameters\PnpInterface\5 = 1` under its service key when the `PnpInterface` key does not exist yet, before `ScsiPortInitialize`. An existing key is left as it is. Both F6 `txtsetup.oem` files also set the value in `[Config.scsi.IDENT]`, so a system installed through F6 gets it from setup as well.
+
+### Several controllers in one machine
+
+Every IDE function and every legacy channel is used, whatever the mix: compatibility-mode functions at 1F0h/170h, native-mode functions at their BARs, ISA channels at 1F0h/170h/1E8h/168h that no PCI function decodes. On NT 3.1–4.0 each channel is an adapter of its own, taken in PCI order (bus, device, function; primary before secondary; with `NATIVEFIRST=1` the native-mode channels first), then the ISA channels; on 9x and 2000/XP each PCI function is one adapter, started in the order Windows enumerates them.
+
+**Native-mode BARs on the legacy ports.** A BIOS may leave the BARs 0–3 of a native-mode function at 1F0h/3F4h/170h/374h (SeaBIOS, the BIOS of QEMU, writes these addresses into every native IDE function other than the PIIX). Next to a compatibility-mode function, which decodes the same ports, both controllers answer: the drives of one hide those of the other, and the bus masters of the two act on the same drive. The typical result is a machine booted from a native-mode controller whose compatibility-mode drives are missing. IDENT resolves this before any channel is used:
+
+- **NT 3.1–4.0:** before the first channel is taken, the driver scans all PCI functions (I/O BARs, bridge windows, IDE functions and the legacy ports of every compatibility-mode channel). A native-mode function whose command or control block overlaps any of these gets a free 32-byte block for its native channels (command block 8 bytes and control block 4 bytes per channel): searched upward from the function's own bus-master block, which lies in the BIOS's pool of PCI I/O space, then downward; at or above 1000h, clear of the ISA 10-bit aliases (`addr & 300h` = 0), outside every other bridge's window on the same bus and inside the window of the bridge in front of the function. I/O decoding is turned off while BAR 0–3 are written, the new addresses are read back, and the old ones are put back if the function does not take them. The debug build logs `Ports: ... moved from 1F0 to ...`.
+- **2000/XP/x64:** the BARs belong to `pci.sys` and the PnP manager. On `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` of a function with native channels, while a compatibility-mode function exists, the 8- and 4-byte port ranges (BAR 0–3) are limited to 1000h and above, so the PnP manager assigns other ports and `pci.sys` programs them when it starts the function. A compatibility-mode function may start first, while the native-mode one still decodes the legacy ports: its start-device hook turns off I/O decoding of every function with all channels in native mode and BARs on the legacy ports, and `pci.sys` turns it on again with the new addresses when that function starts.
+
+- **Windows 9x:** the function is not moved. Windows 9x keeps using BIOS INT 13h for every drive that no protected-mode driver claims, and the BIOS reaches its drives at the addresses it set; moved, those INT 13h drives would read the other controller's drive (tried: the native controller's drive letters then showed the volume of the compatibility-mode drive). Windows 95's Configuration Manager also leaves the native function's device node unstarted while its BARs conflict with the compatibility-mode function, so IDENT9X is not called for it. Without the conflict (a BIOS that assigns free I/O space, as real hardware does) both controllers run under IDENT9X.
+
+**Device detection.** After a channel reset both devices' signatures are read first: every register write reaches both devices, so probing the master overwrites the signature of a packet device (CD/DVD) set as slave behind it. A slave still busy after the reset is given up to 3 s.
 
 ### Command timeout
 
@@ -530,6 +631,48 @@ The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build envi
 - **Bounce buffer** – 512 bytes per channel, used for IDENTIFY, SET FEATURES data and the ATAPI REQUEST SENSE / MODE SENSE commands the driver issues itself
 - **Device extension** – one `HW_DEVICE_EXTENSION` per adapter with two `IDE_CHANNEL`s of two `IDE_DEVICE`s; kept small because the crash dump stack allocates it from a small pool
 
+## Version history
+
+### 1.1.0.0 — 2026-10-19
+
+- ATAPI devices other than CD/DVD drives (Iomega ZIP, LS-120/SuperDisk, MO): INQUIRY reported every ATAPI device as a CD-ROM, so a ZIP drive got a CD-ROM drive letter. The device type now comes from IDENTIFY PACKET DEVICE (word 0 bits 12:8, removable bit 7): a ZIP drive is a removable disk. For those, READ(6)/WRITE(6) are sent as READ(10)/WRITE(10), which ATAPI devices understand, and the MODE SENSE(6) translation now keeps the device-specific parameter (write protect of the medium), the block descriptor length and the mode data length, and asks the drive for the whole requested length.
+- Device Manager page (**Channels** tab, `identpp.dll`) for 2000/XP/x64: channels and devices turned off with check boxes instead of `OFF=` typed into the registry; installed by `ident.inf` and the F6 disks.
+- Every IDE controller in a machine is found, also when booting from a native-mode controller: a native-mode controller that the BIOS left on the legacy ports, where it hid the drives of the compatibility-mode controller, is moved to free I/O space (NT 3.1–4.0) or kept off those ports through its PnP resources (2000/XP/x64).
+- An ATAPI drive set as slave behind a hard disk on the same channel is found.
+- 2000/XP/x64: a compatibility-mode controller with BARs beyond its bus master, or with a PCI interrupt from the firmware, starts with IRQ 14; a controller with one channel of each mode uses the interrupt each channel raises.
+- `NATIVEFIRST=1` (NT 3.1–4.0) gives native-mode channels the first disk numbers, for NT 3.1 booting from a native-mode controller.
+- A CD-ROM drive is found and gets a drive letter on NT 3.1 installed on IDE: `oemsetup.inf` and the driver turn on the CD-ROM class driver (`scsicdrm`, `cdrom` on NT 4.0) and CDFS where they are at `Start = 4`, as NT 3.1 leaves them without a SCSI adapter.
+- Device detection on real hardware: a device that answers in its registers but left no signature after the reset (status 0) is tried as a packet device instead of being skipped, and a slave that IDENTIFY shows to be the master again (a master that answers for an absent slave, same model and serial number) is ignored.
+- NT 3.50–4.0 with an MPS HAL: a channel whose interrupt has no vector in the HAL (no MP table entry) runs with Fast Polling instead of failing its adapter, as found for AHCINT (GitHub issue #2, `0x7B` at boot).
+- Up to 32 IDE controllers (8 before).
+- `OFF=` turns off whole channels or single devices, optionally on one controller only (by its PCI location); on NT 3.1–4.0 a channel turned off gets no adapter, and its ports stay free.
+- Disks of 2 TB and more: READ CAPACITY(10) reported `FFFFFFFFh`, which the class drivers of NT 3.1–4.0, 9x, 2000 and XP x86 turned into a disk of 0 bytes; they now get `FFFFFFFEh` and see the first 2 TB. XP x64 and Server 2003 SP1 and later still get `FFFFFFFFh` and read the full size with READ CAPACITY(16). `RC16=0/1` overrides.
+- System shutdown flushes the write cache only; STANDBY IMMEDIATE on `SRB_FUNCTION_SHUTDOWN` (1.0.0.0) is now opt-in with `STANDBY=1`, as in AHCINT 1.6.0.0 after a reported hang at shutdown on XP x64.
+
+### 1.0.0.0 — 2026-10-12
+
+- Initial release: PATA and SATA-in-IDE-mode controllers on Windows 95/98/Me, NT 3.1–4.0, 2000/XP/2003 x86 and XP x64/2003 x64 from one source tree.
+- UDMA/MWDMA with PIO fallback, controller timing for Intel PIIX/ICH, CMD 64x and Silicon Image 311x, chip errata handling.
+- Compatibility, native and legacy ISA channels; interrupt-driven DMA with a Fast Polling watchdog.
+- 48-bit LBA, 16-byte CDBs, logical sectors up to 4 KB, ATAPI with DMA.
+- TRIM (SCSI UNMAP as ATA DATA SET MANAGEMENT), TRIM mode and the `trimnt` tool.
+- SMART ("SCSIDISK" IOCTL), ATA PASS-THROUGH, VPD B0h/B1h/B2h, LOG SENSE.
+- Standby at shutdown, hibernation and crash dump support on 2000/XP, power IOCTL.
+- In-box IDE drivers turned off on installation and restored on removal (NT).
+
+## Related drivers
+
+AHCINT, IDENT, MMCSDNT and NVMENT are one family: the same ScsiPort miniport design, SCSI translation layer, IOCTL conventions, Fast Polling fallback and TRIM mode, built from one source tree each for every system from Windows 95 and NT 3.1 to XP x64.
+
+| Driver | Storage |
+|---|---|
+| **AHCINT** | SATA disks and optical drives on AHCI controllers |
+| **IDENT** | PATA disks and optical drives, and SATA controllers in IDE mode |
+| **MMCSDNT** | SD/SDHC/SDXC cards and MMC/eMMC on SD host controllers (SDHCI) |
+| **NVMENT** | NVMe SSDs (based on [nvme2k](https://github.com/techomancer/nvme2k) by DominBear) |
+
+`tools\trimnt.exe`, shipped with each of them, trims the free space of a volume on any of the four.
+
 ## License
 
 Copyright (c) 2026 ages2001. All rights reserved.
@@ -546,9 +689,9 @@ Copyright (c) 2026 ages2001. All rights reserved.
 
 - infuscomus for porting the sibling drivers to x64
 - Dietmar for Fast Polling idea
-- DominBear for [nvme2k project](https://github.com/techomancer/nvme2k)
+- DominBear for the [nvme2k](https://github.com/techomancer/nvme2k) project
 - SweetLow for [nvme9x](https://github.com/LordOfMice/Tools) (Windows 9x VMM debug output technique)
 - [UniATA project](http://alter.org.ua/soft/win/uni_ata/)
 - Windows 2000 Dev Community
 - Testers
-- And everyone which supports it
+- And everyone who supports it

@@ -59,7 +59,7 @@
 #define IDE_DRIVER_NAME         "IDENT"
 #endif
 
-#define IDE_DRIVER_VERSION      0x01010000  /* 1.1.0.0 */
+#define IDE_DRIVER_VERSION      0x01020000  /* 1.2.0.0 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -244,7 +244,13 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_SIG_ATAPI_LBA2              0xEB
 
 /* Polling (Fast Polling: every command is completed inside HwStartIo) */
-#define IDE_POLL_INTERVAL_USEC          10
+/* Polling (no interrupt): the first IDE_POLL_SPINS microseconds of checks
+   follow each other without a pause, so that a command done within
+   microseconds is seen at once; then one check per microsecond. A check
+   counts as its pause plus its register reads, so the time limits hold. */
+#define IDE_POLL_SPINS                  64
+#define IDE_POLL_INTERVAL_USEC          1
+#define IDE_POLL_STEP(elapsed, reads) { if ((elapsed) >= IDE_POLL_SPINS) ScsiPortStallExecution(IDE_POLL_INTERVAL_USEC); (elapsed) += IDE_POLL_INTERVAL_USEC + (reads); }
 
 /* Per-command limit, from the SRB's TimeOutValue and ending one second
    before ScsiPort's own request timer would expire (see AHCINT). */
@@ -255,9 +261,19 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_RESET_TIMEOUT_MS            10000       /* BSY after SRST */
 #define IDE_BUSY_WAIT_MS                1000        /* before a command */
 
+/* Requests per channel waiting behind the DMA command in flight
+   (interrupt mode): the next one starts from the completion of the one
+   before, without a round trip through ScsiPort */
+#define IDE_QUEUE_DEPTH                 32
+
 /* Interrupt watchdog: the timer completes what the interrupt missed;
    after this many misses in a row the adapter falls back to Fast Polling. */
 #define IDE_TIMER_USEC                  100000
+
+/* Hot plug (HOTPLUG=1): idle channels are checked this often; a device
+   must read as gone, or a new one as there, this many checks in a row */
+#define IDE_HOTPLUG_USEC                1000000
+#define IDE_HOTPLUG_CONFIRM             2
 #define IDE_MISSED_IRQ_LIMIT            5
 #define IDE_DMA_ERROR_LIMIT             3           /* then PIO for the device */
 
@@ -290,6 +306,7 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_COMMAND_WRITE_DMA           0xCA
 #define IDE_COMMAND_STANDBY_IMMEDIATE   0xE0
 #define IDE_COMMAND_IDLE_IMMEDIATE      0xE1
+#define IDE_COMMAND_IDLE                0xE3        /* count: standby timer */
 #define IDE_COMMAND_FLUSH_CACHE         0xE7
 #define IDE_COMMAND_FLUSH_CACHE_EXT     0xEA
 #define IDE_COMMAND_IDENTIFY_DEVICE     0xEC
@@ -521,6 +538,7 @@ typedef struct _IDE_SRB_IO_CONTROL {
    Send through IOCTL_SCSI_MINIPORT to \\.\ScsiN:. */
 #define IDE_IOCTL_SIGNATURE             "IDENT   "
 #define IDE_IOCTL_GET_INFO              0x00000001
+#define IDE_IOCTL_GET_LOCATION          0x00000002  /* ULONG: bus << 16 | device << 8 | function, FFFFFFFFh none */
 #define IDE_IOCTL_POWER_DOWN            0x00000010  /* flush, standby, channels stopped */
 #define IDE_IOCTL_POWER_UP              0x00000011  /* set the channels up again */
 #define IDE_IOCTL_TRIM_MODE_ON          0x00000020  /* 4 KB pattern after the header */
@@ -651,8 +669,9 @@ typedef struct _IDE_DEVICE {
     BOOLEAN                 Fua;
     BOOLEAN                 FlushExt;
     UCHAR                   PhysExponent;
-    IDE_LBA                 TotalSectors;   /* logical sectors */
+    IDE_LBA                 TotalSectors;   /* logical sectors, as the SCSI side sees them */
     ULONG                   SectorSize;
+    UCHAR                   LbaShift;       /* 4K=1: SCSI block = 2^LbaShift ATA sectors */
     USHORT                  Cylinders;      /* CHS translation (no LBA) */
     UCHAR                   Heads;
     UCHAR                   Spt;
@@ -699,13 +718,14 @@ typedef struct _IDE_CHANNEL {
     BOOLEAN                 Present;        /* ports mapped */
     BOOLEAN                 Native;         /* PCI native mode (shared PCI interrupt) */
     BOOLEAN                 NeedsSetup;     /* after a reset: modes and settings */
-    BOOLEAN                 Async;          /* DMA completes in the interrupt */
+    BOOLEAN                 Async;          /* commands complete in the interrupt */
     UCHAR                   DeviceCount;    /* devices found */
     UCHAR                   Irq;            /* reported, for GET_INFO */
     USHORT                  CmdPort;        /* I/O port numbers, for GET_INFO */
     USHORT                  BmPort;
     BOOLEAN                 Off;            /* OFF=: the channel is left alone */
     UCHAR                   UnitsOff;       /* OFF=c.u: bit 0 master, bit 1 slave left alone */
+    UCHAR                   UnitsPio;       /* PIO=c / c.u: bit 0 master, bit 1 slave with PIO only */
 
     PUCHAR                  Cmd;            /* mapped command block */
     PUCHAR                  Ctl;            /* mapped control register */
@@ -716,13 +736,30 @@ typedef struct _IDE_CHANNEL {
     PUCHAR                  BounceBuffer;
     ULONG                   BouncePhysical;
 
-    /* One DMA command in flight (interrupt mode); a second request for
-       the channel waits in Pending */
+    /* One command in flight (interrupt mode); further requests for the
+       channel wait in Queue, oldest first */
     PSCSI_REQUEST_BLOCK     Outstanding;
-    PSCSI_REQUEST_BLOCK     Pending;
+    PSCSI_REQUEST_BLOCK     Queue[IDE_QUEUE_DEPTH];
+    UCHAR                   QueueHead;
+    UCHAR                   QueueCount;
+    UCHAR                   LuBlocked;      /* bit per unit: NextLuRequest owed */
+    UCHAR                   SelectedUnit;   /* unit in the Device register, 0xFF unknown */
+
+    /* Hot plug, per unit: checks in a row with the device gone (present)
+       or a device there (absent), and whether an absent unit read as an
+       empty position since it was set up (only then is a device new) */
+    UCHAR                   HpPolls[IDE_DEVICES_PER_CHANNEL];
+    BOOLEAN                 HpEmpty[IDE_DEVICES_PER_CHANNEL];
     UCHAR                   ActiveUnit;
     BOOLEAN                 ActiveWrite;
     BOOLEAN                 ActiveAtapi;
+    /* The command in flight is PIO or non-data (no bus master): data
+       moved block by block from the interrupt */
+    BOOLEAN                 ActivePio;
+    BOOLEAN                 ActiveIs48;
+    BOOLEAN                 PioTail;        /* last block read, the device finishing */
+    PUCHAR                  PioBuffer;
+    ULONG                   PioLeft;
 
     IDE_ATA_RESULT          Result;
     IDE_DEVICE              Devices[IDE_DEVICES_PER_CHANNEL];
@@ -736,6 +773,9 @@ typedef struct _IDE_CHANNEL {
 #define IDE_INTEL_ICH100                4           /* UDMA 5 */
 
 /* Other controller families with needs of their own (IdeChipKind) */
+/* PIO by interrupt: how long the interrupt waits for the next DRQ block */
+#define IDE_PIO_SPIN_USEC               200
+
 #define IDE_CHIP_GENERIC                0
 #define IDE_CHIP_CMD643                 1           /* MWDMA only */
 #define IDE_CHIP_CMD646                 2           /* UDMA 2 from revision 5 */
@@ -749,11 +789,21 @@ typedef struct _IDE_CHANNEL {
 #define IDE_CHIP_RZ1000                 10          /* PC Tech RZ1000/1001: PIO only, FIFO errata */
 #define IDE_CHIP_OSB4                   11          /* ServerWorks OSB4: no UDMA on disks */
 #define IDE_CHIP_CSB                    12          /* ServerWorks CSB5/CSB6 */
+#define IDE_CHIP_VIA                    13          /* VIA 82C576 to VX855, 6410/6415 */
+#define IDE_CHIP_AMD                    14          /* AMD 756-8111, CS5536, nVidia nForce: VIA-style timing */
+#define IDE_CHIP_IS_VIA_STYLE(c)        ((c) == IDE_CHIP_VIA || (c) == IDE_CHIP_AMD)
 /* Both channels in one adapter instance, Fast Polling: the two channels
    share one data FIFO and must never be busy at the same time */
 #define IDE_CHIP_SERIALIZED(c)          ((c) == IDE_CHIP_CMD640 || (c) == IDE_CHIP_RZ1000)
 #define IDE_CHIP_IS_CMD(c)              ((c) >= IDE_CHIP_CMD643 && (c) <= IDE_CHIP_CMD649)
 #define IDE_CHIP_IS_SII(c)              ((c) >= IDE_CHIP_SII3112 && (c) <= IDE_CHIP_SII3114)
+
+#define IDE_VIA_BAD_AST                 0x01        /* address setup not programmed */
+#define IDE_VIA_SATA_PATA               0x02        /* primary channel is SATA */
+#define IDE_VIA_BAD_CLK66               0x04        /* 66 MHz UDMA clock off */
+#define IDE_VIA_AMD                     0x08        /* AMD/nVidia UDMA encoding */
+#define IDE_VIA_NVIDIA                  0x10        /* cable from the BIOS's UDMA setting */
+#define IDE_VIA_AMD_CABLE               0x20        /* cable bits in 42h */
 
 /* No UDMA (IdeHostUdmaLimit) */
 #define IDE_NO_UDMA                     0xFFFFFFFF
@@ -798,10 +848,26 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR                   Revision;
     BOOLEAN                 NoLba48Dma;     /* ALi before C5 */
     BOOLEAN                 NoAtapiDma;     /* ALi */
+    BOOLEAN                 AliTiming;      /* ALi: timing programmed (IdeAliSetHost) */
+    UCHAR                   AliUdmaMax;     /* ALi: highest UDMA mode, FFh: none */
+    BOOLEAN                 AliCable40;     /* ALi: cable detection forced to 40 wires (boards) */
+    /* VIA-style timing registers (VIA, AMD, nVidia), see IdeViaSetHost */
+    UCHAR                   ViaBase;        /* 40h, nVidia 50h; 0 = not programmed */
+    UCHAR                   ViaUdmaMax;     /* highest UDMA mode, IDE_NO_UDMA as FFh */
+    UCHAR                   ViaUdmaType;    /* VIA: 2, 4, 5, 6; AMD: clock class 1-4 */
+    UCHAR                   ViaFlags;       /* IDE_VIA_xxx */
+    ULONG                   NvBiosUdma;     /* nVidia: UDMA timing the BIOS left (60h) */
+    BOOLEAN                 ClearSimplex;   /* AMD 756/766: simplex bit reported wrongly */
+    BOOLEAN                 Simplex;        /* both channels use the one DMA engine in turn */
+    UCHAR                   SpinDown;       /* SPINDOWN=n: standby timer, IDLE count (0 = off) */
     UCHAR                   ChannelCount;
     UCHAR                   FirstChannel;   /* controller channel of Channels[0] (0/1) */
 
     BOOLEAN                 AsyncMode;      /* interrupts connected and wanted */
+    BOOLEAN                 QueueAllowed;   /* queued requests per disk (not with QUEUE=0) */
+    BOOLEAN                 HotPlug;        /* HOTPLUG=1: idle channels checked by the timer */
+    ULONG                   TimerUsec;      /* interval of the timer armed */
+    ULONG                   HpElapsed;      /* microseconds since the last hot-plug check */
     BOOLEAN                 DmaAllowed;     /* not disabled by DMA=0 */
     BOOLEAN                 DmaForced;      /* DMA=1: use the best mode even without BIOS hints */
     BOOLEAN                 Stopped;        /* ScsiStopAdapter / POWER_DOWN */
@@ -823,6 +889,7 @@ typedef struct _HW_DEVICE_EXTENSION {
 
     BOOLEAN                 TrimAllowed;    /* TRIM=0 turns UNMAP off */
     BOOLEAN                 Capacity16;     /* class driver follows up with READ CAPACITY(16) */
+    BOOLEAN                 Sector4K;       /* 4K=1: disks of 2 TB and more as 4096-byte blocks */
     BOOLEAN                 StandbyAtShutdown; /* STANDBY=1: spin down on SRB_FUNCTION_SHUTDOWN */
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
     UCHAR                   TrimPattern[IDE_TRIM_PATTERN_SIZE];
@@ -918,8 +985,11 @@ BOOLEAN IdeBusMasterAlive(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel);
 BOOLEAN IdeChannelAlive(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel);
 #if !defined(IDE_NT4)
 VOID    IdeHookPnp(IN PVOID DriverObject);          /* idepnp.c */
+VOID    IdePnpNoteAdapter(IN PVOID HwInit);         /* idepnp.c */
+BOOLEAN IdeSecondaryInterrupt(IN PVOID HwInit, IN BOOLEAN On);
 #endif
 UCHAR   IdeIssueDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req);
+UCHAR   IdeIssuePio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req);
 ULONG   IdeServiceChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN BOOLEAN FromInterrupt);
 VOID    IdeDrainChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel);
 VOID    IdeFailOutstanding(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UCHAR SrbStatus);
@@ -934,5 +1004,7 @@ VOID    IdeShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN U
 VOID    IdeSatlCompleteAtaError(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb);
 VOID    IdeSatlCompleteDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Result);
 BOOLEAN IdeSatlStartPending(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb);
+BOOLEAN IdeDiskQueued(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_CHANNEL Ch, IN PIDE_DEVICE Dev);
+VOID    IdeStartQueued(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel);
 
 #endif /* _IDENT_H_ */

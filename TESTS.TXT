@@ -1,6 +1,242 @@
 IDENT - test results (QEMU 8.2: PIIX3, CMD646, SiI3112); 1.1.0.0: see
 "Several controllers in one machine" below
 
+Hibernation on Windows 2000 and XP x64 (2026-11-03)
+
+- Display: S4 needs a driver on the display adapter. Windows 2000 with
+  -vga cirrus: the in-box Cirrus Logic 5446 driver (display.inf),
+  installed through SetupAPI. XP x64 with the std VGA: the in-box
+  "Standard VGA Graphics Adapter" (display.inf, vgapnp.sys, which XP x64
+  had not picked for the device), installed the same way. No driver was
+  downloaded: the one free QEMU display driver source found
+  (roytam1/vbemp, VBE miniport for NT 3.x) is x86 only and has no power
+  management, so it would not have let S4 through either.
+- Windows 2000 (256 MB, ACPI HAL, patched QEMU with AHCI link power
+  management, NVMe HMB 8 MB and APST): system disk on AHCINT (ICH9
+  port 0), 256 MB disks on AHCI port 1 (AHCINT), on the PIIX3 primary
+  and secondary master (IDENT; the CD as secondary slave), an NVMe
+  namespace (NVMENT) and an SD card on sdhci-pci (MMCSDNT). Power
+  capabilities S3 1 S4 1, hibernation file reserved. bench.exe on the
+  five data disks, hibernate, resume, bench again, hibernate, resume,
+  bench again: all without errors; DRIVER.CAB from the CD and FC: equal
+  afterwards; IDENTIFY through \\.\PhysicalDriveN still reached each
+  disk (the SD card has none). After the second resume QEMU's log shows
+  APST on, the HMB given again (2048 pages, every descriptor checked)
+  and ALPE set on the AHCI ports; before the final power-off ALPE and
+  ADSE were cleared (full power).
+- XP x64 (512 MB, stock QEMU): system disk on IDENT (PIIX3 primary
+  master), data disks on the primary slave and secondary master
+  (IDENT), AHCI port 1 (AHCINT) and NVMe (NVMENT), the CD as secondary
+  slave. S4 1, hibernation file reserved; the same two cycles with
+  bench.exe before and after each: all without errors, then DRIVER.CAB
+  and FC equal, IDENTIFY through each \\.\PhysicalDriveN.
+- After a resume both systems lock the session; a power-off asked for by
+  a program in that locked session (ExitWindowsEx returned success) did
+  not power the machine off, it stayed at the logon screen. With the
+  password on resume turned off (powercfg /globalpowerflag off /option
+  resumepassword, XP x64) the same program powered off at once after a
+  resume. Windows behaviour, not the drivers'.
+
+IRQ 15 on XP x64, SMART through the disk on XP x64 (added to 1.2.0.0,
+2026-11-03)
+
+- XP x64, debug build, PIIX3 in compatibility mode: "PnP start: IRQ 15
+  connected (vector 181, IRQL 8), secondary channel interrupt-driven" and
+  "Channel 1: interrupt (IRQ 15)": ScsiPort's interrupt object for IRQ 14
+  was found at the x64 offsets (taken from KeInitializeInterrupt of the
+  image's NTOSKRNL.EXE) and passed the checks. IRQ 15 is at IRQL 8 on
+  this HAL, below ScsiPort's level for IRQ 14 (9), so the direct path ran
+  (IRQ 15 with ScsiPort's lock, ScsiPort's interrupt routine called from
+  it), which the Windows 2000 runs had not reached. XP x64's ScsiPort
+  connects the second interrupt of a PnP adapter with vector 0 (it fails
+  and is dropped): like Windows 2000's, it computes none for it.
+  bench.exe on the primary slave and the secondary master, DRIVER.CAB
+  from the CD (secondary slave) and FC: equal; 28304 interrupts on IRQ 15
+  in the release run below.
+- SMART through \\.\PhysicalDriveN (disk.sys) on XP x64: the request
+  goes to the disk's PDO as IOCTL_SCSI_MINIPORT, which XP x64's ScsiPort
+  (5.2.3790.1830) answers on a PDO with STATUS_INVALID_DEVICE_REQUEST
+  (disassembly of its PDO device-control routine; only the adapter's
+  device object takes it): smartt.exe reported ERROR_INVALID_FUNCTION on
+  every disk of the driver, \\.\ScsiN: answered. The stock atapi.sys
+  (not a ScsiPort miniport) answers on the same image. With the
+  IRP_MJ_DEVICE_CONTROL front end the request is passed through the PDO
+  as SRB_FUNCTION_IO_CONTROL (ScsiPort's PDO routine takes that function
+  and fills in the disk's address).
+- A first build without an MDL in that request stopped XP x64 with
+  STOP D1 in ScsiPort (it maps the data of every request with
+  DATA_IN/DATA_OUT through the IRP's MDL); with the MDL as below.
+- XP x64 SP1 (5.2.3790.1830, ACPI HAL), an installed image moved to
+  QEMU's PIIX3: system disk on the IDE primary master (IDENT), 256 MB
+  disks as primary slave and secondary master, the XP x64 CD as
+  secondary slave, a 256 MB disk on ICH9 AHCI port 1 (AHCINT), a 256 MB
+  NVMe namespace (NVMENT); the three drivers installed with their INFs
+  through SetupAPI. Release builds: bench.exe on the four data disks,
+  DRIVER.CAB from the CD and FC: equal; IDENTIFY through
+  SMART_RCV_DRIVE_DATA on \\.\PhysicalDrive0-4 returned each disk's own
+  serial number (QM00001, PRISLAVE, SECMASTER, AHCIP1, NVME1), SMART READ
+  DATA answered on each; 32-bit and 64-bit test programs; shutdown
+  powered off.
+- Windows 2000 (regression, release builds): IDENTIFY through
+  \\.\PhysicalDriveN returned the serial of each disk of the driver
+  (the 2000 ScsiPort passed these on before as well); bench, DRIVER.CAB
+  and FC, SMART, hot plug and card change as before.
+
+Secondary channel interrupt on 2000/XP, ALi timing, PIO= (added to
+1.2.0.0, 2026-11-02)
+
+- Windows 2000 (ACPI HAL), PIIX3 in compatibility mode, debug build:
+  "PnP start: IRQ 15 connected (vector 92, IRQL 8, through a DPC),
+  secondary channel interrupt-driven" and "Channel 1: interrupt (IRQ
+  15)": ScsiPort's interrupt object for IRQ 14 was found and passed the
+  checks (IRQL 6); IRQ 15 is at IRQL 8 on this HAL, above ScsiPort's
+  level, so its interrupts are passed through a DPC. bench.exe on the
+  primary master and the secondary slave, DRIVER.CAB from the secondary
+  master and FC: equal; no "interrupts not delivered".
+- The direct path (IRQ 15 at or below ScsiPort's level, the standard PC
+  HAL) was not run here: the images here use the ACPI HAL. It ran on
+  XP x64 (section above).
+- XP x86: not run (no XP x86 image here). XP x64: see the section
+  above.
+- PIO= on Windows 2000: identcfg.exe /t 0 out p1.1 wrote
+  "PIO=0.1.1:1.1"; rundll32 identpp.dll,PortPageTest read it back and
+  listed the secondary slave as "PIO only", the others as "DMA". After
+  a restart: "Channel 1.1: PIO 4 (PIO only (PIO=))", bench on it (PIO,
+  through IRQ 15) without errors, FC equal.
+- ALi (QEMU's PIIX3 shown as 10B9:5229, the simplex bit set; QEMU
+  ignores the timing registers): revision C4h "UDMA 5", disks UDMA 5,
+  the CD PIO (no ATAPI DMA); revision C1h "no UDMA", disks MWDMA 2;
+  bench and FC equal in both. The M1533 bridge and its registers are not
+  in QEMU (the UDMA 2 case of 20h-C1h and the north bridge bits were not
+  reached).
+- Release build of this round: Windows 2000 bench, DRIVER.CAB and FC,
+  SMART of the primary master and the secondary slave, the hot-plug run
+  (primary master pulled and plugged in again); NT 4.0 copy, FC and
+  SMART of master and slave: all as before.
+
+Interrupt completion, VIA/AMD/nVidia timing, simplex, SPINDOWN, SMART
+(added to 1.2.0.0, 2026-11-02)
+
+DMA, PIO, ATAPI and non-data commands (FLUSH, VERIFY, the last chunk of
+a VERIFY) now complete by interrupt where the channel has one; Fast
+Polling remains for channels without an interrupt, IRQ=0, the dump
+instance and the commands at start-up.
+- Windows 2000 (system disk on another adapter), PIIX3 in compatibility
+  mode with a 256 MB disk as primary master, the XP x64 CD as secondary
+  master and a 256 MB disk as secondary slave, debug build: primary
+  channel by interrupt (IRQ 14), secondary with Fast Polling at that
+  time (2000 connects one interrupt per PnP adapter; IRQ 15 is now
+  connected by the driver, see above); bench.exe on
+  both disks (queue depths up to 32, verify passes): no errors;
+  DRIVER.CAB copied from the CD and compared with FC: equal. The first
+  version of this change corrupted the bench data: a DMA command was
+  started while the interrupt path was being turned off; fixed by
+  turning the path off before draining the channel and by a 400 ns
+  settle after each command; the run above is with the fix.
+- PIO only (a build with DMA off): every 512-byte block by interrupt was
+  about six times slower than Fast Polling in QEMU; the driver now takes
+  each following block without waiting for its interrupt when the device
+  has it ready (a spin of up to 200 us). bench without errors, FC equal,
+  speed as with Fast Polling.
+- VIA timing (QEMU's PIIX3 IDE shown as VIA 1106:3164 rev 06 and with
+  the simplex bit set): "VIA south bridge 3164 rev 06, UDMA 6"; primary
+  master UDMA 5 (80-wire), CD UDMA 2 (40-wire), secondary slave UDMA 5;
+  bench on both disks and FC: equal; both channels in DMA (the
+  turn-taking was not stressed: the tests ran one after the other).
+- nVidia timing (shown as 10DE:0065 rev A2, simplex bit set): same
+  modes, bench and FC equal.
+- QEMU ignores the timing registers, so these runs check the chip
+  detection, the mode choice, the register path and the data, not the
+  timing values on real chips. AMD (756-8111) and the other VIA and
+  nVidia IDs were not run.
+- SMART: on NT 3.1-4.0 the secondary channel is an adapter of its own;
+  drive numbers 2/3 (as atapi.sys numbers the secondary channel) now
+  reach its master/slave.
+- NT 4.0 SP1, system disk on the PIIX3 primary master, 64 MB disk as
+  primary slave, CD as secondary master, release build in place of
+  atapi.sys: DRIVER.CAB copied from the CD to the slave disk, FC: equal;
+  smartt.exe: SMART READ DATA of master and slave through
+  \\.\PhysicalDrive0/1 and through \\.\Scsi0: answered (the secondary
+  adapter, with only the CD, answers none, as expected).
+- Found in that run: the image no longer booted (0x7B), with the 1.1.0.0
+  build as well. IDENT turns off the in-box atdisk and atapi services
+  once it has found a controller; installed under the name atapi (as in
+  these test images) it turned off its own service. The driver now
+  leaves the in-box name it runs under alone; the run above is with that
+  change (the image's Start value was put back first).
+- Release build of this version on Windows 2000: bench, DRIVER.CAB and
+  FC: equal; smartt.exe: SMART READ DATA of the primary master and the
+  secondary slave through \\.\PhysicalDriveN and through the IDENT
+  adapter for every drive number: answered (the system disk of that
+  image is on an older AHCINT build, not part of this test); HOTPLUG=1
+  image, primary master pulled during the test program and plugged in
+  again: the requests failed, the disk left and came back, test
+  program afterwards without error.
+- SPINDOWN=n (IDLE with a standby timer at start-up): not tested.
+
+Hot plug, HOTPLUG=1 (added to 1.2.0.0, 2026-11-02)
+
+QEMU 8.2.2 patched for these runs: while a file named after a drive's
+serial number exists, that drive reads as pulled (AHCI: PxSSTS DET 0,
+PxTFD 7Fh, PxSIG all ones, commands not started; IDE: every register
+reads 7Fh, commands ignored); removing the file plugs it in again. The
+test program writes, reads and verifies the raw disk (queue depths 1 to
+32); it was started on the disk before the pull.
+- Windows 2000, PIIX3 primary master (256 MB),
+  DriverParameters HOTPLUG=1:
+  - pulled while idle (debug build): "device gone", channel reset and searched again,
+    the disk left the system; plugged in again: "device arrived", back,
+    full test program run without error.
+  - pulled during writes: the first version left the channel waiting
+    for its setup after the reset of the failed command; the hot-plug
+    check skipped such a channel, so the disk stayed with 0 MB and every
+    request ran a reset and a failing IDENTIFY. Fixed (a channel in that
+    state is checked too; debug build, then the release build): the disk left the system within 2 s, the
+    program ended with errors (expected); plugged in again: back, full
+    test program run without error.
+- Without HOTPLUG: Windows 2000 with IDENT on the PIIX3, release build,
+  test program on the primary master without error.
+- Windows NT 4.0 SP1, system disk on the PIIX3 primary through IDENT (a
+  debug build with HOTPLUG on built in, put in place of atapi.sys; the
+  registry was not edited offline), 64 MB FAT disk on the secondary
+  master: pulled, "device gone", channel reset and searched again; the
+  disk found again after the plug-in; logged on, ntoskrnl.exe copied to
+  D: and compared with FC: equal, and equal on the host.
+- Not run on 9x (IDENT9X could not be installed in the supplied image
+  without its setup).
+- Stays opt-in (HOTPLUG=1): PATA is not hot-pluggable, and a position
+  without a drive can read like the other drive on some controllers.
+
+Additions to 1.2.0.0 (2026-11-02): queued requests, 4K=1, port
+program, GET_LOCATION
+
+- Queued requests (Windows 2000, PIIX3 in compatibility mode, primary
+  channel with IRQ 14): INQUIRY reports CmdQue, the debug build saw up to
+  13 requests waiting in the channel queue. A test program on the raw
+  disk: 128 KB sequential writes, then reads with verify; 4 KB and
+  64 KB random reads at queue depths 1, 8 and 32; 64 KB random writes
+  at depth 8, then 64 KB and 4 KB random reads with verify at depths 8
+  and 32: no error, no mismatch. The same with two disks (master and
+  slave) at once, and with the disk under load while a 60 MB file was
+  copied twice from a CD-ROM drive on the same channel (both copies
+  equal). Throughput under QEMU (TCG) varies too much between runs to
+  compare with the previous version; no figures are given.
+- 4K=1 (Windows 2000, PIIX3 primary master): a sparse 3 TB image; the disk shows
+  4096 bytes per sector and 3145727 MB. A test program wrote 64 KB
+  blocks, each carrying its own byte offset, at 0, 1 TB, 2 TB - 64 KB,
+  2 TB, 2.5 TB + 4 KB and the end, and read them back: all equal, and
+  each block found at its offset in the image file.
+- Port program identcfg.exe on Windows 2000 (/t mode and the window):
+  controller found through HARDWARE\DEVICEMAP\Scsi, PCI location from
+  GET_LOCATION, devices from the inquiry data; an item turned off is
+  stored as OFF=<bus.dev.fn>:<item>. Not run on NT 3.1-4.0 or 9x/Me (no
+  test system with the driver here); it imports only functions those
+  systems have.
+- Build: MinGW-w64 GCC 13 as before; the 2000/XP x86 binary for the
+  Pentium (-march=i586, no CMOV), checked by disassembly; all binaries
+  link without libgcc (no 64-bit division helpers, whose calling
+  convention differs under -mrtd).
+
 Additions to 1.1.0.0 (2026-10-26): OFF=, MPS interrupt check, disks of
 2 TB and more, 32 controllers
 

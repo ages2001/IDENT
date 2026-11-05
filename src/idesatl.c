@@ -73,6 +73,17 @@ IdeLbaRangeValid(IN PIDE_DEVICE Dev, IN IDE_LBA Lba, IN ULONG Count)
     return (BOOLEAN)(endLow <= Dev->TotalSectors.Low);
 }
 
+/* SCSI block address to ATA sector address (4K=1) */
+static IDE_LBA
+IdeAtaLba(IN PIDE_DEVICE Dev, IN IDE_LBA Lba)
+{
+    if (Dev->LbaShift != 0) {
+        Lba.High = (Lba.High << Dev->LbaShift) | (Lba.Low >> (32 - Dev->LbaShift));
+        Lba.Low <<= Dev->LbaShift;
+    }
+    return Lba;
+}
+
 static BOOLEAN
 IdeLbaFits28(IN IDE_LBA Lba, IN ULONG Count)
 {
@@ -102,6 +113,7 @@ IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit
     dev->TotalSectors.Low = 0;
     dev->TotalSectors.High = 0;
     dev->SectorSize = IDE_SECTOR_SIZE;
+    dev->LbaShift = 0;
     dev->PhysExponent = 0;
     dev->Cylinders = 0;
     dev->Heads = 0;
@@ -208,6 +220,18 @@ IdeParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit
     dev->FormFactor = (UCHAR)(id[IDW_FORM_FACTOR] & 0x0F);
     dev->Smart = (BOOLEAN)((id[IDW_CMDSET_SUPPORTED_1] & IDW82_SMART) && (id[IDW_CMDSET_ENABLED_1] & IDW82_SMART) &&
                            id[IDW_CMDSET_SUPPORTED_1] != 0xFFFF);
+
+    /* 4K=1: a disk of 2 TB and more with 512-byte sectors is shown with
+       4096-byte blocks, so systems with 32-bit block addresses (READ(10),
+       an MBR) reach up to 16 TB of it */
+    if (HwInit->Sector4K && dev->SectorSize == IDE_SECTOR_SIZE && dev->TotalSectors.High != 0) {
+        dev->LbaShift = 3;
+        dev->SectorSize = IDE_SECTOR_SIZE << 3;
+        dev->TotalSectors.Low = (dev->TotalSectors.Low >> 3) | (dev->TotalSectors.High << 29);
+        dev->TotalSectors.High >>= 3;
+        dev->PhysExponent = (UCHAR)((dev->PhysExponent > 3) ? dev->PhysExponent - 3 : 0);
+        IDE_DBG((IDE_PFX "Channel %lu.%lu: shown with 4096-byte blocks (4K=1)\n", Channel, Unit));
+    }
 
     IDE_DBG((IDE_PFX "Channel %lu.%lu: LBA=%s LBA48=%s sectors=%08lX:%08lX x %lu bytes, CHS %lu/%lu/%lu, FUA=%s write cache=%s\n",
              Channel, Unit,
@@ -492,7 +516,7 @@ IdeHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_DEVICE Dev, IN PSCSI_RE
     inq.Versions = Dev->IsAtapi ? 0 : IDE_INQUIRY_VERSION_SPC3;
     inq.ResponseDataFormat = 2;
     inq.AdditionalLength = 31;
-    inq.CommandQueue = 0;
+    inq.CommandQueue = (UCHAR)(IdeDiskQueued(HwInit, IDE_CHANNEL_OF_TARGET(HwInit, Srb->TargetId), Dev) ? 1 : 0);
 
     if (Dev->IdentifyValid) {
         IdeExtractAtaString(id, IDE_ID_MODEL, 4, inq.VendorId, 8);
@@ -782,10 +806,11 @@ IdeShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Uni
     }
 }
 
-/* DATA SET MANAGEMENT TRIM of Count sectors from Lba: one 512-byte block
-   of up to 64 ranges per command, through the channel's bounce buffer */
+/* DATA SET MANAGEMENT TRIM of Count ATA sectors from Lba: one 512-byte
+   block of up to 64 ranges per command, through the channel's bounce
+   buffer */
 static ULONG
-IdeTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, IN IDE_LBA Lba, IN ULONG Count)
+IdeTrimAta(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, IN IDE_LBA Lba, IN ULONG Count)
 {
     PIDE_CHANNEL ch = &HwInit->Channels[Channel];
     PULONG range;
@@ -815,6 +840,23 @@ IdeTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, IN IDE_
         req.TimeoutSec = IDE_POLL_TIMEOUT_POWER_SEC;
         result = IdeRunCommand(HwInit, Channel, NULL, &req);
         if (result != IDE_CMD_OK) return result;
+    }
+    return IDE_CMD_OK;
+}
+
+/* TRIM of Count blocks from block Lba (4K=1: eight sectors each) */
+static ULONG
+IdeTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit, IN IDE_LBA Lba, IN ULONG Count)
+{
+    PIDE_DEVICE dev = &HwInit->Channels[Channel].Devices[Unit];
+    ULONG blocks, result;
+
+    while (Count > 0) {
+        blocks = (Count > (0xFFFFFFFFUL >> dev->LbaShift)) ? (0xFFFFFFFFUL >> dev->LbaShift) : Count;
+        result = IdeTrimAta(HwInit, Channel, Unit, IdeAtaLba(dev, Lba), blocks << dev->LbaShift);
+        if (result != IDE_CMD_OK) return result;
+        IdeLbaAdd(&Lba, blocks);
+        Count -= blocks;
     }
     return IDE_CMD_OK;
 }
@@ -858,6 +900,8 @@ IdeBuildReadWrite(
     Req->DataBuffer = Buffer;
     Req->DataBufferLen = Count * Dev->SectorSize;
     Req->IsWrite = IsWrite;
+    Lba = IdeAtaLba(Dev, Lba);
+    Count <<= Dev->LbaShift;
     Req->SectorCount = Count;
 
     if (!Dev->LbaSupported) {
@@ -1125,7 +1169,7 @@ IdeAtaReadWrite(
         return;
     }
 
-    if (dev->MaxSectors != 0 && Count > dev->MaxSectors) {
+    if (dev->MaxSectors != 0 && (Count << dev->LbaShift) > dev->MaxSectors) {
         /* A drive with a per-command limit (Silicon Image 3112 errata):
            the request in pieces, one after the other */
         PUCHAR data = (PUCHAR)Srb->DataBuffer;
@@ -1134,7 +1178,9 @@ IdeAtaReadWrite(
 
         result = IDE_CMD_OK;
         while (Count > 0 && result == IDE_CMD_OK) {
-            chunk = (Count > dev->MaxSectors) ? dev->MaxSectors : Count;
+            chunk = dev->MaxSectors >> dev->LbaShift;
+            if (chunk == 0) chunk = 1;
+            if (chunk > Count) chunk = Count;
             noFua = FALSE;
             result = IdeRunReadWrite(HwInit, Channel, Srb, dev, unit, data, Lba, chunk, IsWrite, &noFua);
             IdeLbaAdd(&Lba, chunk);
@@ -1156,6 +1202,18 @@ IdeAtaReadWrite(
                 return;
             }
             /* No PRD table for this buffer: polled, with PIO */
+        } else if (!req.UseDma && ch->Async && !flushAfter && !HwInit->DumpMode) {
+            /* PIO, block by block from the interrupt */
+            status = IdeIssuePio(HwInit, Channel, Srb, &req);
+            if (status == SRB_STATUS_PENDING) return;
+            if (status != SRB_STATUS_INVALID_REQUEST) {
+                if (status == SRB_STATUS_ERROR) {
+                    IdeSatlCompleteAtaError(HwInit, Channel, Srb);
+                } else {
+                    Srb->SrbStatus = status;
+                }
+                return;
+            }
         }
         result = IdeRunReadWrite(HwInit, Channel, Srb, dev, unit, Srb->DataBuffer, Lba, Count, IsWrite, &Fua);
     }
@@ -1164,6 +1222,27 @@ IdeAtaReadWrite(
     }
     IdeCompleteResult(HwInit, Channel, Srb, result);
 }
+
+/* A non-data command for an SRB by interrupt: TRUE when it was issued or
+   the SRB is complete; FALSE to run it polled */
+static BOOLEAN
+IdeAsyncNonData(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req)
+{
+    UCHAR status;
+
+    if (!HwInit->Channels[Channel].Async || HwInit->DumpMode) return FALSE;
+    status = IdeIssuePio(HwInit, Channel, Srb, Req);
+    if (status == SRB_STATUS_PENDING) return TRUE;
+    if (status == SRB_STATUS_INVALID_REQUEST) return FALSE;
+    if (status == SRB_STATUS_ERROR) {
+        IdeSatlCompleteAtaError(HwInit, Channel, Srb);
+    } else {
+        Srb->SrbStatus = status;
+    }
+    return TRUE;
+}
+
+static VOID IdeAtaSyncCache(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb);
 
 static VOID
 IdeAtaVerify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb,
@@ -1199,8 +1278,8 @@ IdeAtaVerify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_
             req.Chs = TRUE;
             req.Command = IDE_COMMAND_READ_VERIFY;
         } else if (dev->Lba48) {
-            chunk = (Count > ATA_LBA48_MAX_SECTORS) ? ATA_LBA48_MAX_SECTORS : Count;
-            req.Lba = Lba;
+            chunk = (Count > (ATA_LBA48_MAX_SECTORS >> dev->LbaShift)) ? (ATA_LBA48_MAX_SECTORS >> dev->LbaShift) : Count;
+            req.Lba = IdeAtaLba(dev, Lba);
             req.Is48Bit = TRUE;
             req.Command = IDE_COMMAND_READ_VERIFY_EXT;
         } else {
@@ -1208,12 +1287,33 @@ IdeAtaVerify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_
             req.Lba = Lba;
             req.Command = IDE_COMMAND_READ_VERIFY;
         }
-        req.SectorCount = chunk;
-        result = IdeRunCommand(HwInit, Channel, Srb, &req);
+        req.SectorCount = chunk << dev->LbaShift;
         IdeLbaAdd(&Lba, chunk);
         Count -= chunk;
+        if (Count == 0 && IdeAsyncNonData(HwInit, Channel, Srb, &req)) return;
+        result = IdeRunCommand(HwInit, Channel, Srb, &req);
     }
     IdeCompleteResult(HwInit, Channel, Srb, result);
+}
+
+/* SYNCHRONIZE CACHE: FLUSH CACHE (EXT), by interrupt where there is one */
+static VOID
+IdeAtaSyncCache(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    ULONG unit = IDE_UNIT_OF_TARGET(Srb->TargetId);
+    PIDE_DEVICE dev = IDE_DEV(HwInit, Channel, unit);
+    ATA_REQUEST req;
+
+    if (!dev->IdentifyValid || !(dev->Id[IDE_ID_CMDSET_1] & IDW82_WRITE_CACHE)) {
+        IdeGood(Srb);
+        return;
+    }
+    ZeroMemoryBytes(&req, sizeof(req));
+    req.Unit = (UCHAR)unit;
+    req.Command = (UCHAR)(dev->FlushExt ? IDE_COMMAND_FLUSH_CACHE_EXT : IDE_COMMAND_FLUSH_CACHE);
+    req.TimeoutSec = IDE_POLL_TIMEOUT_POWER_SEC;
+    if (IdeAsyncNonData(HwInit, Channel, Srb, &req)) return;
+    IdeCompleteResult(HwInit, Channel, Srb, IdeRunCommand(HwInit, Channel, Srb, &req));
 }
 
 static VOID
@@ -1395,8 +1495,7 @@ IdeProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQU
 
     case SCSIOP_SYNCHRONIZE_CACHE:
     case IDE_SCSIOP_SYNC_CACHE16:
-        IdeCompleteResult(HwInit, Channel, Srb,
-                          IdeFlushDevice(HwInit, Channel, unit) ? IDE_CMD_OK : IDE_CMD_DEVICE_ERROR);
+        IdeAtaSyncCache(HwInit, Channel, Srb);
         return;
 
     case IDE_SCSIOP_START_STOP_UNIT:
@@ -1706,6 +1805,18 @@ IdeProcessAtapiSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_RE
         }
         req.UseDma = FALSE;                     /* no PRD table for this buffer */
     }
+    if (!req.UseDma && ch->Async && !HwInit->DumpMode) {
+        status = IdeIssuePio(HwInit, Channel, Srb, &req);
+        if (status == SRB_STATUS_PENDING) return;
+        if (status != SRB_STATUS_INVALID_REQUEST) {
+            if (status == SRB_STATUS_ERROR) {
+                IdeAtapiFailed(HwInit, Channel, Srb);
+            } else {
+                Srb->SrbStatus = status;
+            }
+            return;
+        }
+    }
 
     result = IdeRunCommand(HwInit, Channel, Srb, &req);
     if (result == IDE_CMD_BAD_BUFFER && req.UseDma) {
@@ -1819,6 +1930,11 @@ IdeSmartDevice(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb, IN UC
     ULONG target = Drive;
     PIDE_DEVICE dev;
 
+    /* atapi.sys numbers 0-3 over both channels; an adapter of one channel
+       (NT 3.1-4.0) takes 2/3 as its own master/slave */
+    if (target >= HwInit->ChannelCount * IDE_DEVICES_PER_CHANNEL && target < 4) {
+        target %= HwInit->ChannelCount * IDE_DEVICES_PER_CHANNEL;
+    }
     if (target >= HwInit->ChannelCount * IDE_DEVICES_PER_CHANNEL ||
         !IDE_DEVICE_OF_TARGET(HwInit, target)->Present) {
         target = Srb->TargetId;
@@ -2018,6 +2134,16 @@ IdeProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         case IDE_IOCTL_GET_INFO:
             if (available >= sizeof(IDE_IOCTL_INFO)) {
                 IdeFillInfo(HwInit, (PIDE_IOCTL_INFO)((PUCHAR)ctl + ctl->HeaderLength));
+            } else {
+                ctl->ReturnCode = 1;
+            }
+            break;
+        case IDE_IOCTL_GET_LOCATION:
+            if (available >= sizeof(ULONG)) {
+                PCI_SLOT_NUMBER slot;
+                slot.u.AsULONG = HwInit->PciSlot;
+                *(PULONG)((PUCHAR)ctl + ctl->HeaderLength) = !HwInit->HasPci ? 0xFFFFFFFF :
+                    (HwInit->PciBus << 16) | (slot.u.bits.DeviceNumber << 8) | slot.u.bits.FunctionNumber;
             } else {
                 ctl->ReturnCode = 1;
             }

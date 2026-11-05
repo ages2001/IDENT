@@ -12,6 +12,7 @@ ULONG   IdeFindAdapter(IN PVOID DeviceExtension, IN PVOID Context, IN PVOID BusI
                        IN PCHAR ArgumentString, IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
                        OUT PBOOLEAN Again);
 VOID    IdeTimer(IN PVOID DeviceExtension);
+static VOID IdeArmHotPlug(IN PHW_DEVICE_EXTENSION HwInit);
 #ifdef IDE_W9X
 BOOLEAN IdeAdapterState(IN PVOID DeviceExtension, IN PVOID Context, IN BOOLEAN SaveState);
 #endif
@@ -380,6 +381,31 @@ IdeChipKind(IN USHORT VendorId, IN USHORT DeviceId)
         if (DeviceId == 0x436E || DeviceId == 0x4379 || DeviceId == 0x437A) return IDE_CHIP_SII3112;
     } else if (VendorId == 0x10B9 && DeviceId == 0x5229) {
         return IDE_CHIP_ALI;
+    } else if (VendorId == 0x1106) {
+        switch (DeviceId) {
+        case 0x0415: case 0x0571: case 0x0581: case 0x1571:
+        case 0x3164: case 0x5324: case 0xC409: case 0x9001:
+            return IDE_CHIP_VIA;
+        default:
+            break;
+        }
+    } else if (VendorId == 0x1022) {
+        switch (DeviceId) {
+        case 0x7401: case 0x7409: case 0x7411: case 0x7441: case 0x7469:
+        case 0x209A: case 0x2092:
+            return IDE_CHIP_AMD;
+        default:
+            break;
+        }
+    } else if (VendorId == 0x10DE) {
+        switch (DeviceId) {
+        case 0x01BC: case 0x0065: case 0x0085: case 0x00D5: case 0x00E5:
+        case 0x0053: case 0x0035: case 0x0265: case 0x036E: case 0x03EC:
+        case 0x0448: case 0x0560: case 0x056C: case 0x0759:
+            return IDE_CHIP_AMD;
+        default:
+            break;
+        }
     }
     return IDE_CHIP_GENERIC;
 }
@@ -455,6 +481,204 @@ IdeChipInit(IN PHW_DEVICE_EXTENSION HwInit)
             }
         }
     }
+}
+
+/* VIA: the UDMA generation comes from the south bridge (device ID and
+   revision), as Linux pata_via tells them apart; a 6410/6415 card is
+   its own "bridge". Table order matters: the first match wins. */
+typedef struct _IDE_VIA_BRIDGE {
+    USHORT Vendor;
+    USHORT Device;
+    UCHAR  RevMin;
+    UCHAR  RevMax;
+    UCHAR  Udma;                                /* 0: MWDMA only */
+    UCHAR  Flags;
+} IDE_VIA_BRIDGE;
+
+static const IDE_VIA_BRIDGE g_IdeViaBridges[] = {
+    { 0x1106, 0x8409, 0x00, 0x2F, 6, IDE_VIA_BAD_AST | IDE_VIA_SATA_PATA },    /* VX855 */
+    { 0x1106, 0x8353, 0x00, 0x2F, 6, IDE_VIA_BAD_AST | IDE_VIA_SATA_PATA },    /* VX800 */
+    { 0x1106, 0x3402, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8261 */
+    { 0x1106, 0x3372, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8237S */
+    { 0x1106, 0x3287, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8251 */
+    { 0x1106, 0x8324, 0x00, 0x2F, 6, IDE_VIA_BAD_AST | IDE_VIA_SATA_PATA },    /* CX700 */
+    { 0x1106, 0x3164, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 6410 */
+    { 0x1106, 0x0415, 0x00, 0xFF, 6, IDE_VIA_BAD_AST },                        /* 6415 */
+    { 0x1106, 0x3337, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8237A */
+    { 0x1106, 0x3227, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8237 */
+    { 0x1106, 0x3177, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8235 */
+    { 0x1106, 0x3147, 0x00, 0x2F, 6, IDE_VIA_BAD_AST },                        /* 8233A */
+    { 0x1106, 0x3109, 0x00, 0x2F, 5, 0 },                                      /* 8233C */
+    { 0x1106, 0x3074, 0x00, 0x2F, 5, 0 },                                      /* 8233 */
+    { 0x1106, 0x8231, 0x00, 0x2F, 5, 0 },                                      /* 8231 */
+    { 0x1106, 0x0686, 0x40, 0x4F, 5, 0 },                                      /* 82C686B */
+    { 0x1106, 0x0686, 0x10, 0x2F, 4, 0 },                                      /* 82C686A */
+    { 0x1106, 0x0686, 0x00, 0x0F, 2, IDE_VIA_BAD_CLK66 },                      /* 82C686 */
+    { 0x1106, 0x0596, 0x10, 0x2F, 4, 0 },                                      /* 82C596B */
+    { 0x1106, 0x0596, 0x00, 0x0F, 2, IDE_VIA_BAD_CLK66 },                      /* 82C596A */
+    { 0x1106, 0x0586, 0x20, 0x4F, 2, 0 },                                      /* 82C586A/B */
+    { 0x1106, 0x0586, 0x00, 0x0F, 0, 0 },                                      /* 82C586 */
+    { 0x1106, 0x0576, 0x00, 0x2F, 0, 0 },                                      /* 82C576 */
+    { 0x1107, 0x0576, 0x00, 0x2F, 0, 0 },                                      /* 82C576 (bad vendor ID) */
+};
+#define IDE_VIA_BRIDGES (sizeof(g_IdeViaBridges) / sizeof(g_IdeViaBridges[0]))
+
+/* ALi M5229: the UDMA generation from the revision (and, for 20h-C1h,
+   the M1533 south bridge), the chip set up as Linux pata_ali does it
+   (init_chipset), its timing programmed by IdeAliSetHost */
+static VOID
+IdeAliSetup(IN PHW_DEVICE_EXTENSION HwInit, IN PPCI_COMMON_CONFIG PciConfig)
+{
+    ULONG saveBus = HwInit->PciBus, saveSlot = HwInit->PciSlot;
+    ULONG dev, id, v, bridgeSlot = 0xFFFFFFFF, north;
+    PCI_SLOT_NUMBER slot;
+    UCHAR rev = HwInit->Revision;
+    ULONG sub = ((ULONG)PciConfig->u.type0.SubVendorID << 16) | PciConfig->u.type0.SubSystemID;
+
+    HwInit->AliTiming = FALSE;
+    HwInit->AliUdmaMax = 0xFF;
+    if (!HwInit->PciWritable) return;
+
+    /* M1533 on bus 0, and the north bridge at 00:00.0 */
+    HwInit->PciBus = 0;
+    for (dev = 0; dev < 32; dev++) {
+        slot.u.AsULONG = 0;
+        slot.u.bits.DeviceNumber = dev;
+        HwInit->PciSlot = slot.u.AsULONG;
+        id = IdePciReadConfig(HwInit, 0x00, 4);
+        if (id == ((0x1533UL << 16) | 0x10B9)) {
+            bridgeSlot = slot.u.AsULONG;
+            break;
+        }
+    }
+    HwInit->PciSlot = 0;
+    north = IdePciReadConfig(HwInit, 0x00, 4) & 0xFFFF;
+
+    if (rev >= 0xC5) HwInit->AliUdmaMax = 6;
+    else if (rev == 0xC4) HwInit->AliUdmaMax = 5;
+    else if (rev >= 0xC2) HwInit->AliUdmaMax = 4;
+    else if (rev >= 0x20 && bridgeSlot != 0xFFFFFFFF) {
+        HwInit->PciSlot = bridgeSlot;
+        if ((IdePciReadConfig(HwInit, 0x5E, 1) & 0x1E) == 0x12) HwInit->AliUdmaMax = 2;
+    }
+    /* North bridge of ALi with the M1533: its UDMA bits (Linux) */
+    if (north == 0x10B9 && bridgeSlot != 0xFFFFFFFF && rev >= 0xC2 && rev < 0xC5) {
+        HwInit->PciSlot = bridgeSlot;
+        v = IdePciReadConfig(HwInit, 0x79, 1);
+        IdePciWriteConfig(HwInit, 0x79, 1, v | ((rev == 0xC2) ? 0x04 : 0x02));
+    }
+    HwInit->PciBus = saveBus;
+    HwInit->PciSlot = saveSlot;
+
+    if (rev <= 0x20) {
+        IdePciWriteConfig(HwInit, 0x53, 1, IdePciReadConfig(HwInit, 0x53, 1) | 0x03);
+    } else {
+        IdePciWriteConfig(HwInit, 0x4A, 1, IdePciReadConfig(HwInit, 0x4A, 1) | 0x20);
+        v = IdePciReadConfig(HwInit, 0x4B, 1);
+        v = (rev < 0xC2) ? (v & 0x7F) : (v | 0x01);
+        IdePciWriteConfig(HwInit, 0x4B, 1, v | 0x08);
+        IdePciWriteConfig(HwInit, 0x53, 1, IdePciReadConfig(HwInit, 0x53, 1) | ((rev >= 0xC7) ? 0x03 : 0x01));
+    }
+    /* Boards whose cable detection reads 80 wires on a short 40-wire cable */
+    HwInit->AliCable40 = (BOOLEAN)(sub == ((0x10CFUL << 16) | 0x10AF) || sub == ((0x1071UL << 16) | 0x8317));
+    HwInit->ClearSimplex = TRUE;
+    HwInit->AliTiming = TRUE;
+    if (HwInit->AliUdmaMax == 0xFF) {
+        IDE_DBG((IDE_PFX "FindAdapter: ALi M5229 rev %02lX, no UDMA%s\n", (ULONG)rev,
+                 bridgeSlot != 0xFFFFFFFF ? ", M1533 found" : ""));
+    } else {
+        IDE_DBG((IDE_PFX "FindAdapter: ALi M5229 rev %02lX, UDMA %lu%s\n", (ULONG)rev, (ULONG)HwInit->AliUdmaMax,
+                 bridgeSlot != 0xFFFFFFFF ? ", M1533 found" : ""));
+    }
+}
+
+/* VIA-style timing: which generation, and the chip fix-ups. FALSE when
+   the generation is not known; the timing then stays as the BIOS set it. */
+static BOOLEAN
+IdeViaStyleSetup(IN PHW_DEVICE_EXTENSION HwInit, IN PPCI_COMMON_CONFIG PciConfig)
+{
+    ULONG saveBus = HwInit->PciBus, saveSlot = HwInit->PciSlot;
+    ULONG found[40], count = 0, bus, dev, k, id, i;
+    PCI_SLOT_NUMBER slot;
+    USHORT vendor = PciConfig->VendorID, device = PciConfig->DeviceID;
+    UCHAR rev = PciConfig->RevisionID;
+
+    HwInit->ViaBase = 0;
+    HwInit->ViaFlags = 0;
+    if (!HwInit->PciWritable) return FALSE;
+
+    if (vendor == 0x1022 || vendor == 0x10DE) {
+        HwInit->ViaBase = (UCHAR)((vendor == 0x10DE) ? 0x50 : 0x40);
+        HwInit->ViaFlags = IDE_VIA_AMD;
+        switch (device) {
+        case 0x7401: HwInit->ViaUdmaMax = 2; HwInit->ViaUdmaType = 1; break;           /* 756 */
+        case 0x7409: HwInit->ViaUdmaMax = 4; HwInit->ViaUdmaType = 2; break;           /* 766 */
+        case 0x7411: case 0x7441: case 0x209A: case 0x2092:
+                     HwInit->ViaUdmaMax = 5; HwInit->ViaUdmaType = 3; break;           /* 768, 8111 rev. A, CS5536 */
+        case 0x7469: HwInit->ViaUdmaMax = 6; HwInit->ViaUdmaType = 4;                  /* 8111 */
+                     HwInit->ViaFlags |= IDE_VIA_AMD_CABLE;
+                     /* Serenade boards: UDMA 5 at most */
+                     if (IdePciReadConfig(HwInit, 0x2C, 4) == ((0x36C0UL << 16) | 0x1022)) HwInit->ViaUdmaMax = 5;
+                     break;
+        case 0x01BC: HwInit->ViaUdmaMax = 5; HwInit->ViaUdmaType = 3;                  /* nForce */
+                     HwInit->ViaFlags |= IDE_VIA_NVIDIA; break;
+        default:     HwInit->ViaUdmaMax = 6; HwInit->ViaUdmaType = 4;                  /* nForce2 and later */
+                     HwInit->ViaFlags |= IDE_VIA_NVIDIA; break;
+        }
+        if (HwInit->ViaFlags & IDE_VIA_NVIDIA) HwInit->NvBiosUdma = IdePciReadConfig(HwInit, 0x60, 4);
+        if (vendor == 0x1022) {
+            /* Prefetch FIFO: off for now, per channel below (the 768's is broken) */
+            ULONG fifo = IdePciReadConfig(HwInit, 0x41, 1) & 0x0F;
+            if (device != 0x7411) fifo |= 0xF0;
+            IdePciWriteConfig(HwInit, 0x41, 1, fifo);
+        }
+        /* 756/766: the simplex bit is wrong */
+        if (device == 0x7401 || device == 0x7409) HwInit->ClearSimplex = TRUE;
+        return TRUE;
+    }
+
+    /* VIA: the function itself, then function 0 of every device on its bus and bus 0 */
+    found[count++] = ((ULONG)device << 16) | ((ULONG)vendor & 0xFFFF);
+    found[count++] = rev;
+    for (k = 0; k < 2; k++) {
+        bus = k ? 0 : saveBus;
+        if (k && saveBus == 0) break;
+        for (dev = 0; dev < 32 && count + 2 <= sizeof(found) / sizeof(found[0]); dev++) {
+            slot.u.AsULONG = 0;
+            slot.u.bits.DeviceNumber = dev;
+            HwInit->PciBus = bus;
+            HwInit->PciSlot = slot.u.AsULONG;
+            id = IdePciReadConfig(HwInit, 0x00, 4);
+            if ((id & 0xFFFF) != 0x1106 && (id & 0xFFFF) != 0x1107) continue;
+            found[count++] = id;
+            found[count++] = IdePciReadConfig(HwInit, 0x08, 1);
+        }
+    }
+    HwInit->PciBus = saveBus;
+    HwInit->PciSlot = saveSlot;
+
+    for (i = 0; i < IDE_VIA_BRIDGES; i++) {
+        const IDE_VIA_BRIDGE *b = &g_IdeViaBridges[i];
+        for (k = 0; k < count; k += 2) {
+            if (found[k] != (((ULONG)b->Device << 16) | b->Vendor)) continue;
+            if (found[k + 1] < b->RevMin || found[k + 1] > b->RevMax) continue;
+            HwInit->ViaBase = 0x40;
+            HwInit->ViaFlags = b->Flags;
+            HwInit->ViaUdmaType = b->Udma;
+            HwInit->ViaUdmaMax = (UCHAR)(b->Udma ? b->Udma : 0xFF);
+            /* UDMA 66 parts need their 66 MHz clock, the early ones must not use it */
+            if (b->Udma == 4) {
+                IdePciWriteConfig(HwInit, 0x50, 4, IdePciReadConfig(HwInit, 0x50, 4) | 0x80008UL);
+            } else if (b->Flags & IDE_VIA_BAD_CLK66) {
+                IdePciWriteConfig(HwInit, 0x50, 4, IdePciReadConfig(HwInit, 0x50, 4) & ~0x80008UL);
+            }
+            IDE_DBG((IDE_PFX "FindAdapter: VIA south bridge %04lX rev %02lX, UDMA %lu\n",
+                     (ULONG)b->Device, found[k + 1], (ULONG)b->Udma));
+            return TRUE;
+        }
+    }
+    IDE_DBG((IDE_PFX "FindAdapter: VIA south bridge not known, timing as the BIOS set it\n"));
+    return FALSE;
 }
 
 /* Intel 450NX servers: PIIX4 DMA can hang with the original 82454NX PXB,
@@ -537,6 +761,7 @@ IdeChipSetup(IN PHW_DEVICE_EXTENSION HwInit, IN PPCI_COMMON_CONFIG PciConfig,
         if (HwInit->Revision < 0x20) HwInit->DmaAllowed = FALSE;
         if (HwInit->Revision < 0xC5) HwInit->NoLba48Dma = TRUE;
         HwInit->NoAtapiDma = TRUE;
+        IdeAliSetup(HwInit, PciConfig);
         break;
     case IDE_CHIP_SII3112:
     case IDE_CHIP_SII3512:
@@ -558,6 +783,10 @@ IdeChipSetup(IN PHW_DEVICE_EXTENSION HwInit, IN PPCI_COMMON_CONFIG PciConfig,
         }
         IDE_DBG((IDE_PFX "FindAdapter: Silicon Image registers at %08lX %s\n", pa.LowPart,
                  HwInit->SiiMmio != NULL ? "mapped" : "not mapped, timing as the BIOS set it"));
+        break;
+    case IDE_CHIP_VIA:
+    case IDE_CHIP_AMD:
+        IdeViaStyleSetup(HwInit, PciConfig);
         break;
     default:
         break;
@@ -1181,8 +1410,15 @@ IdeInitializeChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
     BOOLEAN noSignature;
 
     ch->Outstanding = NULL;
-    ch->Pending = NULL;
+    ch->QueueHead = 0;
+    ch->QueueCount = 0;
+    ch->LuBlocked = 0;
+    ch->SelectedUnit = 0xFF;
     ch->DeviceCount = 0;
+    for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+        ch->HpPolls[unit] = 0;
+        ch->HpEmpty[unit] = FALSE;
+    }
 
     if (ch->Off) {
         /* OFF=: no reset, no commands, no devices */
@@ -1282,7 +1518,7 @@ IdeInitializeAll(IN PHW_DEVICE_EXTENSION HwInit)
         if (HwInit->Channels[c].Present) IdeInitializeChannel(HwInit, c);
     }
     HwInit->Stopped = FALSE;
-    HwInit->CheckState = FALSE;
+    HwInit->CheckState = FALSE;    IdeArmHotPlug(HwInit);
 }
 
 /* After a power transition or a BIOS that used the controller: set
@@ -1294,7 +1530,7 @@ IdeReinitialize(IN PHW_DEVICE_EXTENSION HwInit)
 
     IDE_DBG((IDE_PFX "Reinitialize\n"));
     for (c = 0; c < HwInit->ChannelCount; c++) {
-        if (HwInit->Channels[c].Outstanding != NULL || HwInit->Channels[c].Pending != NULL) {
+        if (HwInit->Channels[c].Outstanding != NULL || HwInit->Channels[c].QueueCount != 0) {
             IdeFailOutstanding(HwInit, c, SRB_STATUS_BUS_RESET);
         }
     }
@@ -1355,13 +1591,61 @@ IdePowerDown(IN PHW_DEVICE_EXTENSION HwInit)
 /* Interrupt watchdog                                                  */
 /* ------------------------------------------------------------------ */
 
+/* One timer per adapter: the interrupt watchdog (short) and the hot-plug
+   check (long). A request while one is pending is not passed on: the
+   pending one runs first and asks again, so that ScsiPort never gets a
+   second request for a timer it still holds. */
+static VOID
+IdeRequestTimer(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Usec)
+{
+    if (HwInit->TimerArmed) return;
+    HwInit->TimerArmed = TRUE;
+    HwInit->TimerUsec = Usec;
+    ScsiPortNotification(RequestTimerCall, HwInit, IdeTimer, Usec);
+}
+
 VOID
 IdeArmTimer(IN PHW_DEVICE_EXTENSION HwInit)
 {
-    if (HwInit->TimerArmed || !HwInit->AsyncMode) return;
-    HwInit->TimerArmed = TRUE;
-    ScsiPortNotification(RequestTimerCall, HwInit, IdeTimer, IDE_TIMER_USEC);
+    if (!HwInit->AsyncMode) return;
+    IdeRequestTimer(HwInit, IDE_TIMER_USEC);
 }
+
+static VOID
+IdeArmHotPlug(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    if (!HwInit->HotPlug || HwInit->Stopped) return;
+    IdeRequestTimer(HwInit, IDE_HOTPLUG_USEC);
+}
+
+#if !defined(IDE_NT4)
+/* The secondary channel of a compatibility-mode function on its own
+   IRQ 15 (connected by the PnP front end) or back to Fast Polling; called
+   synchronized with the interrupt. FALSE: nothing to switch. */
+BOOLEAN
+IdeSecondaryInterrupt(IN PVOID HwInitContext, IN BOOLEAN On)
+{
+    PHW_DEVICE_EXTENSION HwInit = (PHW_DEVICE_EXTENSION)HwInitContext;
+    BOOLEAN found = FALSE;
+    ULONG c;
+
+    if (On && !HwInit->AsyncMode) return FALSE;
+    for (c = 0; c < HwInit->ChannelCount; c++) {
+        PIDE_CHANNEL ch = &HwInit->Channels[c];
+        if (ch->Native || ch->Irq != IDE_LEGACY_SECONDARY_IRQ) continue;
+        if (On) {
+            if (ch->Present && ch->Outstanding != NULL) IdeDrainChannel(HwInit, c);
+            ch->Async = TRUE;
+        } else {
+            ch->Async = FALSE;
+            if (ch->Present && ch->Outstanding != NULL) IdeDrainChannel(HwInit, c);
+        }
+        found = TRUE;
+        IDE_DBG((IDE_PFX "Channel %lu: %s\n", c, On ? "interrupt (IRQ 15)" : "Fast Polling"));
+    }
+    return found;
+}
+#endif
 
 /* Back to Fast Polling for good */
 static VOID
@@ -1370,33 +1654,137 @@ IdeDisableAsync(IN PHW_DEVICE_EXTENSION HwInit)
     ULONG c;
 
     IDE_DBG((IDE_PFX "Interrupts not delivered, back to Fast Polling\n"));
+    /* Off first: the requests that waited are then run polled while the
+       channels drain */
+    for (c = 0; c < HwInit->ChannelCount; c++) HwInit->Channels[c].Async = FALSE;
     for (c = 0; c < HwInit->ChannelCount; c++) {
         if (HwInit->Channels[c].Present) IdeDrainChannel(HwInit, c);
-        HwInit->Channels[c].Async = FALSE;
     }
     HwInit->AsyncMode = FALSE;
 }
 
+/* ------------------------------------------------------------------ */
+/* Hot plug (HOTPLUG=1)                                                */
+/* ------------------------------------------------------------------ */
+
+/* Status of a position as the check sees it: FFh (floating bus) and 7Fh
+   (what SATA controllers in IDE mode return for an empty port) are no
+   device; 00h is nothing there either for a position without one */
+static BOOLEAN
+IdeStatusGone(IN UCHAR Status)
+{
+    return (BOOLEAN)(Status == 0xFF || Status == 0x7F);
+}
+
+/* Every idle channel, both positions (also one waiting for its setup
+   after a reset, which a device that went away during a command leaves
+   behind): a device that reads as gone
+   twice in a row, or a device where the position read as empty before
+   and now reads as a device twice in a row, has the channel reset and
+   its devices found again. A channel busy with a DMA command only has
+   its active device checked: when that one is gone, what the channel
+   has in flight and in its queue fails. 2000/XP/x64: ScsiPort is told,
+   and the disks come and go in the system; NT 3.1-4.0 and 9x: a device
+   that comes back is usable again at the same address. */
+static VOID
+IdeHotPlugCheck(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG c, unit;
+    BOOLEAN busChange = FALSE;
+
+    for (c = 0; c < HwInit->ChannelCount; c++) {
+        PIDE_CHANNEL ch = &HwInit->Channels[c];
+        BOOLEAN change = FALSE, before[IDE_DEVICES_PER_CHANNEL];
+        UCHAR status;
+
+        if (!ch->Present || ch->Off) continue;
+
+        if (ch->Outstanding != NULL) {
+            unit = ch->ActiveUnit;
+            if (!IdeStatusGone(IdeAltStatus(ch))) {
+                ch->HpPolls[unit] = 0;
+                continue;
+            }
+            if (++ch->HpPolls[unit] < IDE_HOTPLUG_CONFIRM) continue;
+            IDE_DBG((IDE_PFX "Channel %lu.%lu: device gone with a command in flight\n", c, unit));
+            IdeFailOutstanding(HwInit, c, SRB_STATUS_SELECTION_TIMEOUT);
+            ch->HpPolls[unit] = IDE_HOTPLUG_CONFIRM;
+        }
+
+        for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+            PIDE_DEVICE dev = &ch->Devices[unit];
+            if (ch->UnitsOff & (1U << unit)) continue;
+            if (ch->SelectedUnit != unit) IdeSelectUnit(ch, unit);
+            status = IdeAltStatus(ch);
+            if (dev->Present) {
+                if (!IdeStatusGone(status)) {
+                    ch->HpPolls[unit] = 0;
+                } else if (++ch->HpPolls[unit] >= IDE_HOTPLUG_CONFIRM) {
+                    IDE_DBG((IDE_PFX "Channel %lu.%lu: device gone (status %02lX)\n", c, unit, (ULONG)status));
+                    change = TRUE;
+                }
+            } else if (IdeStatusGone(status) || status == 0x00) {
+                ch->HpEmpty[unit] = TRUE;
+                ch->HpPolls[unit] = 0;
+            } else if (ch->HpEmpty[unit] && ++ch->HpPolls[unit] >= IDE_HOTPLUG_CONFIRM) {
+                IDE_DBG((IDE_PFX "Channel %lu.%lu: device arrived (status %02lX)\n", c, unit, (ULONG)status));
+                change = TRUE;
+            }
+        }
+        if (!change) continue;
+
+        /* The device that stays keeps what it has cached; then the reset
+           and the search of the channel */
+        for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+            before[unit] = ch->Devices[unit].Present;
+            if (ch->Devices[unit].Present && ch->HpPolls[unit] == 0 && !ch->Devices[unit].IsAtapi) {
+                IdeFlushDevice(HwInit, c, unit);
+            }
+        }
+        IdeInitializeChannel(HwInit, c);
+        for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+            if (ch->Devices[unit].Present != before[unit]) busChange = TRUE;
+        }
+    }
+#if !defined(IDE_NT4)
+    if (busChange) ScsiPortNotification(BusChangeDetected, HwInit, 0);
+#else
+    (VOID)busChange;
+#endif
+}
+
+/* Interrupt watchdog: the timer completes what the interrupt missed.
+   Hot plug: the channels are checked. */
 VOID
 IdeTimer(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
-    ULONG c, missed = 0;
+    ULONG c, missed = 0, elapsed = hwInit->TimerUsec;
     BOOLEAN pending = FALSE;
 
     hwInit->TimerArmed = FALSE;
-    if (!hwInit->AsyncMode || hwInit->Stopped) return;
+    if (hwInit->Stopped) return;
 
-    for (c = 0; c < hwInit->ChannelCount; c++) {
-        if (hwInit->Channels[c].Outstanding == NULL) continue;
-        missed += IdeServiceChannel(hwInit, c, FALSE);
-        if (hwInit->Channels[c].Outstanding != NULL) pending = TRUE;
+    if (hwInit->AsyncMode) {
+        for (c = 0; c < hwInit->ChannelCount; c++) {
+            if (hwInit->Channels[c].Outstanding == NULL) continue;
+            missed += IdeServiceChannel(hwInit, c, FALSE);
+            if (hwInit->Channels[c].Outstanding != NULL) pending = TRUE;
+        }
+        if (missed != 0 && ++hwInit->MissedInterrupts >= IDE_MISSED_IRQ_LIMIT) {
+            IdeDisableAsync(hwInit);
+            pending = FALSE;
+        }
     }
-    if (missed != 0 && ++hwInit->MissedInterrupts >= IDE_MISSED_IRQ_LIMIT) {
-        IdeDisableAsync(hwInit);
-        return;
+    if (hwInit->HotPlug) {
+        hwInit->HpElapsed += elapsed;
+        if (hwInit->HpElapsed >= IDE_HOTPLUG_USEC) {
+            hwInit->HpElapsed = 0;
+            IdeHotPlugCheck(hwInit);
+        }
     }
     if (pending) IdeArmTimer(hwInit);
+    IdeArmHotPlug(hwInit);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1630,6 +2018,23 @@ IdeEnableCdromDrivers(IN PVOID Services)
     if (rec >= 4) IdeServiceEnable(Services, g_IdeCdfsName, sizeof(g_IdeCdfsName), "cdfs");
 }
 
+/* Name (Count characters) equal to the zero-terminated Ref, case ignored */
+static BOOLEAN
+IdeSameName(IN USHORT *Name, IN ULONG Count, IN USHORT *Ref)
+{
+    ULONG i;
+    USHORT a, b;
+
+    for (i = 0; i < Count; i++) {
+        a = Name[i]; b = Ref[i];
+        if (b == 0) return FALSE;
+        if (a >= 'A' && a <= 'Z') a = (USHORT)(a + 'a' - 'A');
+        if (b >= 'A' && b <= 'Z') b = (USHORT)(b + 'a' - 'A');
+        if (a != b) return FALSE;
+    }
+    return (BOOLEAN)(Ref[Count] == 0);
+}
+
 static VOID
 IdeDisableInboxDrivers(IN PVOID RegistryPath)
 {
@@ -1673,6 +2078,8 @@ IdeDisableInboxDrivers(IN PVOID RegistryPath)
     }
 
     for (i = 0; i < 2; i++) {
+        /* IDENT installed under that name: its own key */
+        if (IdeSameName(&path->Buffer[n], path->Length / sizeof(USHORT) - n, inbox[i])) continue;
         key = IdeRegOpen(services, inbox[i], inboxBytes[i]);
         if (key == NULL) continue;
         if (!IdeRegReadDword(ident, saved[i], savedBytes[i], &old) &&
@@ -1737,6 +2144,10 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
 #ifdef IDE_NT31_COMPAT
     initData.HwInitializationDataSize = IDE_HWINIT_SIZE_NT35;
+#elif defined(IDE_W9X)
+    /* SCSIPORT.PDR fails any structure larger than 4Ch bytes (up to
+       DeviceId) with "Init Failure", before HwFindAdapter is called */
+    initData.HwInitializationDataSize = (ULONG)FIELD_OFFSET(HW_INITIALIZATION_DATA, DeviceId) + sizeof(PVOID);
 #else
     initData.HwInitializationDataSize = sizeof(HW_INITIALIZATION_DATA);
 #endif
@@ -1759,8 +2170,16 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     initData.MapBuffers = TRUE;
     initData.NeedPhysicalAddresses = TRUE;
     initData.AutoRequestSense = FALSE;
+#if defined(IDE_NT4)
     initData.TaggedQueuing = FALSE;
     initData.MultipleRequestPerLu = FALSE;
+#else
+    /* 2000/XP/x64: queued requests per disk in interrupt mode; INQUIRY
+       reports CmdQue only for disks that get them (IdeDiskQueued). Not in
+       the dump stack. */
+    initData.TaggedQueuing = (BOOLEAN)!g_IdeDumpMode;
+    initData.MultipleRequestPerLu = (BOOLEAN)!g_IdeDumpMode;
+#endif
 
 #if !defined(IDE_NT4)
     if (!g_IdeDumpMode) IdeEnsurePnpInterface(Argument2);
@@ -1900,14 +2319,41 @@ IdeParseDecimal(IN PCHAR P, OUT PULONG Value)
     return (P == start) ? NULL : P;
 }
 
-/* OFF=item[,item...]: channels and devices the driver leaves alone.
+/* SPINDOWN=n (minutes, 1-330): the ATA standby timer count. 1-240 count
+   in units of 5 s (up to 20 minutes), 241-251 in units of 30 minutes. */
+static UCHAR
+IdeSpinDownCount(IN PCHAR Args)
+{
+    ULONG i, n;
+    static const CHAR key[] = "SPINDOWN=";
+
+    if (Args == NULL) return 0;
+    for (i = 0; Args[i] != 0; i++) {
+        ULONG j;
+        for (j = 0; key[j] != 0; j++) {
+            CHAR c = Args[i + j];
+            if (c >= 'a' && c <= 'z') c = (CHAR)(c - 'a' + 'A');
+            if (c != key[j]) break;
+        }
+        if (key[j] != 0) continue;
+        if (IdeParseDecimal(&Args[i + j], &n) == NULL || n == 0) return 0;
+        if (n <= 20) return (UCHAR)(n * 12);
+        n = (n + 29) / 30;
+        return (UCHAR)(240 + ((n > 11) ? 11 : n));
+    }
+    return 0;
+}
+
+/* OFF=item[,item...]: channels and devices the driver leaves alone;
+   PIO=item[,item...]: channels and devices that run with PIO only.
    item = [bus.device.function:]channel[.unit], all decimal: channel 0 is
    the primary, 1 the secondary; unit 0 the master, 1 the slave. With the
    PCI location (as Device Manager shows it) the item applies to that
    controller only, without it to every controller. TRUE when the whole
-   channel is off; UnitsOff gets the units turned off one by one. */
+   channel is listed; Units gets the units listed one by one. */
 static BOOLEAN
-IdeOffLookup(IN PCHAR Args, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULONG Channel, OUT PUCHAR UnitsOff)
+IdeListLookup(IN PCHAR Args, IN PCHAR Key, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULONG Channel,
+              OUT PUCHAR Units)
 {
     ULONG i, j, n, v[5], count, colon;
     PCHAR p;
@@ -1918,13 +2364,12 @@ IdeOffLookup(IN PCHAR Args, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULON
 
     slot.u.AsULONG = Slot;
     for (i = 0; Args != NULL && Args[i] != 0; i++) {
-        static const CHAR key[] = "OFF=";
-        for (j = 0; key[j] != 0; j++) {
+        for (j = 0; Key[j] != 0; j++) {
             a = Args[i + j];
             if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
-            if (a != key[j]) break;
+            if (a != Key[j]) break;
         }
-        if (key[j] != 0) continue;
+        if (Key[j] != 0) continue;
         p = &Args[i + j];
         for (;;) {
             count = 0;
@@ -1951,8 +2396,14 @@ IdeOffLookup(IN PCHAR Args, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULON
             p++;
         }
     }
-    if (UnitsOff != NULL) *UnitsOff = units;
+    if (Units != NULL) *Units = units;
     return off;
+}
+
+static BOOLEAN
+IdeOffLookup(IN PCHAR Args, IN BOOLEAN Pci, IN ULONG Bus, IN ULONG Slot, IN ULONG Channel, OUT PUCHAR UnitsOff)
+{
+    return IdeListLookup(Args, "OFF=", Pci, Bus, Slot, Channel, UnitsOff);
 }
 
 ULONG
@@ -2013,10 +2464,18 @@ IdeFindAdapter(
 #endif
     hwInit->DmaAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "DMA=0");
     hwInit->TrimAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "TRIM=0");
+#if defined(IDE_NT4)
+    hwInit->QueueAllowed = FALSE;
+#else
+    hwInit->QueueAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "QUEUE=0");
+#endif
     hwInit->StandbyAtShutdown = IdeArgPresent(ArgumentString, "STANDBY=1");
+    hwInit->SpinDown = IdeSpinDownCount(ArgumentString);
     hwInit->Capacity16 = g_IdeCapacity16;
     if (IdeArgPresent(ArgumentString, "RC16=1")) hwInit->Capacity16 = TRUE;
     if (IdeArgPresent(ArgumentString, "RC16=0")) hwInit->Capacity16 = FALSE;
+    hwInit->Sector4K = IdeArgPresent(ArgumentString, "4K=1");
+    hwInit->HotPlug = (BOOLEAN)(IdeArgPresent(ArgumentString, "HOTPLUG=1") && !hwInit->DumpMode);
     hwInit->DmaForced = IdeArgPresent(ArgumentString, "DMA=1");
     hwInit->PciWritable = TRUE;
 
@@ -2289,6 +2748,10 @@ selectChannel:
         }
         hwInit->Channels[c].Off = IdeOffLookup(ArgumentString, pci, targetBus, targetSlot, desc[first + c].Index,
                                                &hwInit->Channels[c].UnitsOff);
+        if (IdeListLookup(ArgumentString, "PIO=", pci, targetBus, targetSlot, desc[first + c].Index,
+                          &hwInit->Channels[c].UnitsPio)) {
+            hwInit->Channels[c].UnitsPio = (1U << IDE_DEVICES_PER_CHANNEL) - 1;
+        }
     }
     hwInit->ChannelCount = (UCHAR)count;
     if (hwInit->HasPci && !IdeChipSetup(hwInit, &pciConfig, busType, busNumber)) {
@@ -2329,10 +2792,10 @@ selectChannel:
         }
     }
 
-    /* Interrupt-completed DMA where an interrupt is connected: the first
+    /* Commands complete in the interrupt where one is connected: the first
        channel's, the second one's own (BusInterruptLevel2) or the shared
-       PCI line of a native-mode controller. Off in the dump stack, with
-       IRQ=0, on 9x unless IRQ=1. */
+       PCI line of a native-mode controller. Off in the dump stack and with
+       IRQ=0. */
     interrupts = (BOOLEAN)(ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0);
 #ifdef IDE_W9X
     level2 = FALSE;                             /* SCSIPORT.PDR has no second interrupt */
@@ -2343,7 +2806,6 @@ selectChannel:
     if (hwInit->DumpMode || IdeArgPresent(ArgumentString, "IRQ=0")) interrupts = FALSE;
     if (IDE_CHIP_SERIALIZED(hwInit->Chip)) interrupts = FALSE;
 #ifdef IDE_W9X
-    if (!IdeArgPresent(ArgumentString, "IRQ=1")) interrupts = FALSE;
     /* Their latch is cleared in config space, which is not touched from
        an interrupt on 9x */
     if (hwInit->Chip == IDE_CHIP_CMD643 || hwInit->Chip == IDE_CHIP_CMD646) interrupts = FALSE;
@@ -2368,8 +2830,22 @@ selectChannel:
                                         : (irq == ch->Irq));
         }
 #endif
-        ch->Async = (BOOLEAN)(interrupts && ch->Bm != NULL && line);
+        ch->Async = (BOOLEAN)(interrupts && line);
     }
+#if !defined(IDE_NT4)
+    /* PnP start of a compatibility-mode function: the PnP front end
+       connects IRQ 15 for the secondary channel once ScsiPort started the
+       adapter (x86) */
+    if (!legacyPass && interrupts) {
+        for (c = 0; c < count; c++) {
+            PIDE_CHANNEL ch = &hwInit->Channels[c];
+            if (!ch->Native && !ch->Async && ch->Irq == IDE_LEGACY_SECONDARY_IRQ) {
+                IdePnpNoteAdapter(hwInit);
+                break;
+            }
+        }
+    }
+#endif
 
     IDE_DBG((IDE_PFX "FindAdapter: %lu channel(s) at %lX%s, IRQ %lu/%lu, %s%s\n",
              count, (ULONG)desc[first].CmdPort, hwInit->Channels[0].Bm ? " (bus master)" : "",
@@ -2411,8 +2887,16 @@ IdeResetTarget(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Target)
     IdeResetChannel(HwInit, c);
 }
 
+/* A disk that takes queued requests: interrupt mode with DMA */
+BOOLEAN
+IdeDiskQueued(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_CHANNEL Ch, IN PIDE_DEVICE Dev)
+{
+    return (BOOLEAN)(HwInit->QueueAllowed && !HwInit->DumpMode && Ch->Async && HwInit->AsyncMode &&
+                     Dev->Present && !Dev->IsAtapi && Dev->UseDma);
+}
+
 /* A DMA read/write for a channel that is busy with one already: it can
-   wait and be started from the completion of the first */
+   wait and be started from the completion of the one before */
 static BOOLEAN
 IdeCanQueue(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -2441,6 +2925,22 @@ IdeCanQueue(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
     }
 }
 
+/* After a request went to the channel or its queue: a queued request
+   (tagged) lets ScsiPort send the next one for the same disk while there
+   is room, otherwise only requests for other targets */
+static VOID
+IdeRequestNext(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_CHANNEL Ch, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    if (Ch != NULL && (Srb->SrbFlags & SRB_FLAGS_QUEUE_ACTION_ENABLE) && Srb->Function == SRB_FUNCTION_EXECUTE_SCSI) {
+        if (Ch->QueueCount < IDE_QUEUE_DEPTH) {
+            ScsiPortNotification(NextLuRequest, HwInit, Srb->PathId, Srb->TargetId, Srb->Lun);
+            return;
+        }
+        Ch->LuBlocked |= (UCHAR)(1 << IDE_UNIT_OF_TARGET(Srb->TargetId));
+    }
+    ScsiPortNotification(NextRequest, HwInit, NULL);
+}
+
 BOOLEAN
 IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -2456,9 +2956,10 @@ IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     /* The channel is busy with an interrupt-completed command */
     if (ch != NULL && ch->Outstanding != NULL) {
-        if (ch->Pending == NULL && IdeCanQueue(hwInit, Srb)) {
-            ch->Pending = Srb;
-            ScsiPortNotification(NextRequest, hwInit, NULL);
+        if (ch->QueueCount < IDE_QUEUE_DEPTH && IdeCanQueue(hwInit, Srb)) {
+            ch->Queue[(ch->QueueHead + ch->QueueCount) % IDE_QUEUE_DEPTH] = Srb;
+            ch->QueueCount++;
+            IdeRequestNext(hwInit, ch, Srb);
             return TRUE;
         }
         IdeDrainChannel(hwInit, Srb->TargetId / IDE_DEVICES_PER_CHANNEL);
@@ -2510,10 +3011,11 @@ IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     if (Srb->SrbStatus != SRB_STATUS_PENDING) {
         ScsiPortNotification(RequestComplete, hwInit, Srb);
+        ScsiPortNotification(NextRequest, hwInit, NULL);
     } else {
         IdeArmTimer(hwInit);
+        IdeRequestNext(hwInit, ch, Srb);
     }
-    ScsiPortNotification(NextRequest, hwInit, NULL);
     return TRUE;
 }
 

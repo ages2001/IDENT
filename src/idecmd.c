@@ -24,8 +24,7 @@ IdeWaitStatus(IN PIDE_CHANNEL Ch, IN UCHAR Mask, IN UCHAR Value, IN ULONG Timeou
         status = IdeAltStatus(Ch);
         if ((status & Mask) == Value) return TRUE;
         if (elapsed >= TimeoutUsec) return FALSE;
-        ScsiPortStallExecution(IDE_POLL_INTERVAL_USEC);
-        elapsed += IDE_POLL_INTERVAL_USEC;
+        IDE_POLL_STEP(elapsed, 1);
     }
 }
 
@@ -35,6 +34,7 @@ VOID
 IdeSelectUnit(IN PIDE_CHANNEL Ch, IN ULONG Unit)
 {
     IDE_OUTB(Ch->Cmd + IDE_REG_DEVICE, IDE_DEV_DEFAULT | (Unit ? IDE_DEV_SLAVE : 0));
+    Ch->SelectedUnit = (UCHAR)Unit;
     IdeAltStatus(Ch);
     IdeAltStatus(Ch);
     ScsiPortStallExecution(1);
@@ -88,6 +88,7 @@ IdeResetChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
     ULONG ms;
     UCHAR status;
 
+    ch->SelectedUnit = 0xFF;
     if (ch->Bm != NULL) {
         IDE_OUTB(ch->Bm + BM_REG_COMMAND, 0);
         IDE_OUTB(ch->Bm + BM_REG_STATUS, IDE_INB(ch->Bm + BM_REG_STATUS) | BM_STS_INTERRUPT | BM_STS_ERROR);
@@ -195,12 +196,18 @@ IdeTimeoutUsec(IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req)
     return sec * 1000000UL;
 }
 
-/* Select the device and wait until it accepts a command */
+/* Select the device and wait until it accepts a command. The device the
+   last command went to is still selected: only its status is checked. */
 static BOOLEAN
 IdePrepareDevice(IN PIDE_CHANNEL Ch, IN ULONG Unit)
 {
+    if (Ch->SelectedUnit == Unit) {
+        if ((IdeAltStatus(Ch) & (IDE_STS_BSY | IDE_STS_DRQ)) == 0) return TRUE;
+        Ch->SelectedUnit = 0xFF;
+    }
     IdeSelectUnit(Ch, Unit);
     if (!IdeWaitStatus(Ch, IDE_STS_BSY | IDE_STS_DRQ, 0, IDE_BUSY_WAIT_MS * 1000UL)) {
+        Ch->SelectedUnit = 0xFF;
         return FALSE;
     }
     IdeSelectUnit(Ch, Unit);
@@ -296,6 +303,8 @@ IdeSendPacket(IN PIDE_CHANNEL Ch, IN PATA_REQUEST Req, IN ULONG TimeoutUsec)
     return TRUE;
 }
 
+static VOID IdeSimplexWait(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel);
+
 /* ------------------------------------------------------------------ */
 /* PIO data phase                                                      */
 /* ------------------------------------------------------------------ */
@@ -303,20 +312,21 @@ IdeSendPacket(IN PIDE_CHANNEL Ch, IN PATA_REQUEST Req, IN ULONG TimeoutUsec)
 /* One DRQ block in or out. ATAPI devices say how much they move per
    phase; ATA moves one sector (or the IDENTIFY/log 512 bytes). */
 static VOID
-IdePioBlock(IN PIDE_CHANNEL Ch, IN PATA_REQUEST Req, IN OUT PUCHAR *Buffer, IN OUT PULONG Left, IN ULONG BlockSize)
+IdePioBlock(IN PIDE_CHANNEL Ch, IN BOOLEAN IsAtapi, IN BOOLEAN IsWrite, IN OUT PUCHAR *Buffer, IN OUT PULONG Left,
+            IN ULONG BlockSize)
 {
     PUCHAR data = Ch->Cmd + IDE_REG_DATA;
     ULONG n, words, i;
     USHORT w;
 
-    if (Req->IsAtapi) {
+    if (IsAtapi) {
         BlockSize = (ULONG)IDE_INB(Ch->Cmd + IDE_REG_LBA1) | ((ULONG)IDE_INB(Ch->Cmd + IDE_REG_LBA2) << 8);
         if (BlockSize == 0) BlockSize = 2;
     }
     n = (BlockSize > *Left) ? *Left : BlockSize;
     words = n / 2;
 
-    if (Req->IsWrite) {
+    if (IsWrite) {
         if (words != 0) IDE_OUTSW(data, *Buffer, words);
         if (n & 1) {
             w = (*Buffer)[n - 1];
@@ -364,6 +374,7 @@ IdeRunCommand(
 
     timeoutUsec = IdeTimeoutUsec(Srb, Req);
     useDma = (BOOLEAN)(Req->UseDma && ch->Bm != NULL && Req->DataBufferLen != 0 && !Req->UseBounce);
+    if (useDma) IdeSimplexWait(HwInit, Channel);
     IdeChannelAlive(HwInit, Channel);
     if (useDma && !IdeBusMasterAlive(HwInit, Channel)) return IDE_CMD_HBA_ERROR;
 
@@ -414,8 +425,7 @@ IdeRunCommand(
                 timedOut = TRUE;
                 break;
             }
-            ScsiPortStallExecution(IDE_POLL_INTERVAL_USEC);
-            elapsed += IDE_POLL_INTERVAL_USEC;
+            IDE_POLL_STEP(elapsed, 1);
         }
         IDE_OUTB(ch->Bm + BM_REG_COMMAND, 0);
         IDE_OUTB(ch->Bm + BM_REG_STATUS, bmsts | BM_STS_INTERRUPT | BM_STS_ERROR);
@@ -436,8 +446,7 @@ IdeRunCommand(
                 status = IdeAltStatus(ch);
                 if (!(status & IDE_STS_BSY)) break;
                 if (elapsed >= timeoutUsec) break;
-                ScsiPortStallExecution(IDE_POLL_INTERVAL_USEC);
-                elapsed += IDE_POLL_INTERVAL_USEC;
+                IDE_POLL_STEP(elapsed, 1);
             }
             if (status & IDE_STS_BSY) {
                 result = IDE_CMD_HBA_ERROR;
@@ -458,7 +467,7 @@ IdeRunCommand(
                 result = IDE_CMD_HBA_ERROR;
                 break;
             }
-            IdePioBlock(ch, Req, &buffer, &left, blockSize);
+            IdePioBlock(ch, Req->IsAtapi, Req->IsWrite, &buffer, &left, blockSize);
             /* Give the device its 400 ns before the status is read again */
             IdeAltStatus(ch);
         }
@@ -574,6 +583,11 @@ IdeApplyDeviceSettings(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULON
     if (dev->WantLookAhead != 0) {
         IdeRunSimple(HwInit, Channel, Unit, IDE_COMMAND_SET_FEATURES,
                      (USHORT)((dev->WantLookAhead == 1) ? IDE_FEATURE_ENABLE_LOOKAHEAD : IDE_FEATURE_DISABLE_LOOKAHEAD), 0, 0);
+    }
+    /* SPINDOWN=n: the drive's own standby timer (IDLE with a count), so it
+       spins down after n idle minutes on any Windows version */
+    if (HwInit->SpinDown != 0 && dev->RotationRate != 1) {
+        IdeRunSimple(HwInit, Channel, Unit, IDE_COMMAND_IDLE, 0, HwInit->SpinDown, 0);
     }
 }
 
@@ -790,6 +804,204 @@ IdeCmdSetHost(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
     IdePciWriteConfig(HwInit, udmaReg, 1, udma);
 }
 
+/* ATA timing in ns per mode (PIO 0-4, MWDMA 0-2, UDMA 0-6): address
+   setup, 8-bit active/recovery/cycle, active, recovery, cycle, UDMA cycle */
+static const USHORT g_IdeAtaTiming[15][8] = {
+    { 70, 290, 240, 600, 165, 150, 600,   0 },
+    { 50, 290,  93, 383, 125, 100, 383,   0 },
+    { 30, 290,  40, 330, 100,  90, 240,   0 },
+    { 30,  80,  70, 180,  80,  70, 180,   0 },
+    { 25,  70,  25, 120,  70,  25, 120,   0 },
+    { 60,   0,   0,   0, 215, 215, 480,   0 },
+    { 45,   0,   0,   0,  80,  50, 150,   0 },
+    { 25,   0,   0,   0,  70,  25, 120,   0 },
+    {  0,   0,   0,   0,   0,   0,   0, 120 },
+    {  0,   0,   0,   0,   0,   0,   0,  80 },
+    {  0,   0,   0,   0,   0,   0,   0,  60 },
+    {  0,   0,   0,   0,   0,   0,   0,  45 },
+    {  0,   0,   0,   0,   0,   0,   0,  30 },
+    {  0,   0,   0,   0,   0,   0,   0,  20 },
+    {  0,   0,   0,   0,   0,   0,   0,  15 },
+};
+#define IDE_T_SETUP     0
+#define IDE_T_ACT8B     1
+#define IDE_T_REC8B     2
+#define IDE_T_CYC8B     3
+#define IDE_T_ACTIVE    4
+#define IDE_T_RECOVER   5
+#define IDE_T_CYCLE     6
+#define IDE_T_UDMA      7
+
+/* Clocks for one mode: bus clock T and UDMA clock UT in ps, rounded up;
+   a DMA mode also covers the PIO mode (PIO commands run with the same
+   timing), and active plus recovery are stretched to the cycle time */
+static VOID
+IdeTimingClocks(IN ULONG Index, IN ULONG PioIndex, IN ULONG T, IN ULONG UT, OUT ULONG Clk[8])
+{
+    ULONG i, v, p;
+
+    for (i = 0; i < 8; i++) {
+        v = g_IdeAtaTiming[Index][i];
+        Clk[i] = v ? (v * 1000 - 1) / ((i == IDE_T_UDMA) ? UT : T) + 1 : 0;
+        if (Index > 4) {
+            p = g_IdeAtaTiming[PioIndex][i];
+            p = p ? (p * 1000 - 1) / ((i == IDE_T_UDMA) ? UT : T) + 1 : 0;
+            if (p > Clk[i]) Clk[i] = p;
+        }
+    }
+    if (Clk[IDE_T_ACT8B] + Clk[IDE_T_REC8B] < Clk[IDE_T_CYC8B]) {
+        Clk[IDE_T_ACT8B] += (Clk[IDE_T_CYC8B] - (Clk[IDE_T_ACT8B] + Clk[IDE_T_REC8B])) / 2;
+        Clk[IDE_T_REC8B] = Clk[IDE_T_CYC8B] - Clk[IDE_T_ACT8B];
+    }
+    if (Clk[IDE_T_ACTIVE] + Clk[IDE_T_RECOVER] < Clk[IDE_T_CYCLE]) {
+        Clk[IDE_T_ACTIVE] += (Clk[IDE_T_CYCLE] - (Clk[IDE_T_ACTIVE] + Clk[IDE_T_RECOVER])) / 2;
+        Clk[IDE_T_RECOVER] = Clk[IDE_T_CYCLE] - Clk[IDE_T_ACTIVE];
+    }
+}
+
+static ULONG
+IdeClamp(IN ULONG V, IN ULONG Lo, IN ULONG Hi)
+{
+    return (V < Lo) ? Lo : (V > Hi) ? Hi : V;
+}
+
+/* Timing index of the mode in effect: PIO 0-4, MWDMA 5-7, UDMA 8-14 */
+static ULONG
+IdeModeIndex(IN PIDE_DEVICE Dev)
+{
+    if (Dev->UseDma && Dev->ModeType == IDE_MODE_MWDMA) return 5 + (Dev->Mode > 2 ? 2 : Dev->Mode);
+    if (Dev->UseDma && Dev->ModeType == IDE_MODE_UDMA) return 8 + (Dev->Mode > 6 ? 6 : Dev->Mode);
+    return (Dev->PioMode > 4) ? 4 : Dev->PioMode;
+}
+
+/* VIA, AMD and nVidia (one register layout, at 40h or 50h, 33 MHz bus):
+   address setup (+0Ch, two bits per drive), 8-bit command timing per
+   channel (+0Fh - channel), active/recovery per drive (+08h + 3 - drive),
+   UDMA per drive (+10h + 3 - drive). The 8-bit timing is shared by both
+   drives of the channel, so the slower one sets it. The values follow
+   the ATA timing tables as Linux pata_via/pata_amd apply them. */
+static VOID
+IdeViaSetHost(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
+{
+    static const UCHAR amdCyc2Udma[16] = { 6, 6, 5, 4, 0, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3, 7 };
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PIDE_DEVICE dev = &ch->Devices[Unit];
+    PIDE_DEVICE pair = &ch->Devices[Unit ^ 1];
+    ULONG port = HwInit->FirstChannel + Channel;
+    ULONG dn = port * 2 + Unit;
+    ULONG base = HwInit->ViaBase;
+    ULONG T = 30000, UT = 30000;                /* ps */
+    ULONG clk[8], peer[8], index = IdeModeIndex(dev);
+    ULONG v, shift, code;
+    BOOLEAN amd = (BOOLEAN)((HwInit->ViaFlags & IDE_VIA_AMD) != 0);
+    BOOLEAN udma = (BOOLEAN)(dev->UseDma && dev->ModeType == IDE_MODE_UDMA);
+
+    if (base == 0 || port > 1) return;
+    if (amd) {
+        if (HwInit->ViaUdmaType >= 2) UT = T / 2;
+    } else {
+        switch (HwInit->ViaUdmaType) {
+        case 4: UT = T / 2; break;
+        case 5: UT = T / 3; break;
+        case 6: UT = T / 4; break;
+        default: break;
+        }
+    }
+    IdeTimingClocks(index, (dev->PioMode > 4) ? 4 : dev->PioMode, T, UT, clk);
+    if (pair->Present) {
+        ULONG pp = (pair->PioMode > 4) ? 4 : pair->PioMode;
+        IdeTimingClocks(pp, pp, T, UT, peer);
+        if (peer[IDE_T_ACT8B] > clk[IDE_T_ACT8B]) clk[IDE_T_ACT8B] = peer[IDE_T_ACT8B];
+        if (peer[IDE_T_REC8B] > clk[IDE_T_REC8B]) clk[IDE_T_REC8B] = peer[IDE_T_REC8B];
+    }
+
+    if (!(HwInit->ViaFlags & IDE_VIA_BAD_AST)) {
+        shift = (3 - dn) * 2;
+        v = IdePciReadConfig(HwInit, base + 0x0C, 1);
+        v = (v & ~(3UL << shift)) | ((IdeClamp(clk[IDE_T_SETUP], 1, 4) - 1) << shift);
+        IdePciWriteConfig(HwInit, base + 0x0C, 1, v);
+    }
+    IdePciWriteConfig(HwInit, base + 0x0F - port, 1,
+                      ((IdeClamp(clk[IDE_T_ACT8B], 1, 16) - 1) << 4) | (IdeClamp(clk[IDE_T_REC8B], 1, 16) - 1));
+    IdePciWriteConfig(HwInit, base + 0x08 + 3 - dn, 1,
+                      ((IdeClamp(clk[IDE_T_ACTIVE], 1, 16) - 1) << 4) | (IdeClamp(clk[IDE_T_RECOVER], 1, 16) - 1));
+
+    if (amd) {
+        /* UDMA 5/6 at 33 MHz: fixed codes */
+        if (udma && dev->Mode == 5) clk[IDE_T_UDMA] = 1;
+        if (udma && dev->Mode >= 6) clk[IDE_T_UDMA] = 15;
+        code = 0x03;                            /* UDMA off */
+        if (udma) {
+            switch (HwInit->ViaUdmaType) {
+            case 1:  code = 0xC0 | (IdeClamp(clk[IDE_T_UDMA], 2, 5) - 2); break;
+            case 2:  code = 0xC0 | amdCyc2Udma[IdeClamp(clk[IDE_T_UDMA], 2, 10)]; break;
+            case 3:  code = 0xC0 | amdCyc2Udma[IdeClamp(clk[IDE_T_UDMA], 1, 10)]; break;
+            default: code = 0xC0 | amdCyc2Udma[IdeClamp(clk[IDE_T_UDMA], 1, 15)]; break;
+            }
+        }
+        IdePciWriteConfig(HwInit, base + 0x10 + 3 - dn, 1, code);
+    } else if (HwInit->ViaUdmaType != 0) {
+        v = IdePciReadConfig(HwInit, base + 0x10 + 3 - dn, 1) & ~0x20UL;
+        if (udma) {
+            switch (HwInit->ViaUdmaType) {
+            case 2:  code = 0xE0 | (IdeClamp(clk[IDE_T_UDMA], 2, 5) - 2); break;
+            case 4:  code = 0xE8 | (IdeClamp(clk[IDE_T_UDMA], 2, 9) - 2); break;
+            default: code = 0xE0 | (IdeClamp(clk[IDE_T_UDMA], 2, 9) - 2); break;
+            }
+            v = (v & 0x10) | code;              /* bit 4: cable detection, kept */
+        }
+        IdePciWriteConfig(HwInit, base + 0x10 + 3 - dn, 1, v);
+    }
+}
+
+/* ALi M5229 (33 MHz bus): FIFO per drive (54h + channel, a nibble per
+   drive), address setup (58h + 4 * channel), 8-bit command timing (59h +
+   4 * channel, shared by both drives: the slower sets it), active and
+   recovery per drive (5Ah + 4 * channel + drive), UDMA per drive (56h +
+   channel, a nibble); the values as Linux pata_ali applies them */
+static VOID
+IdeAliSetHost(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
+{
+    static const UCHAR udmaCode[7] = { 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x0F, 0x0D };
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PIDE_DEVICE dev = &ch->Devices[Unit];
+    PIDE_DEVICE pair = &ch->Devices[Unit ^ 1];
+    ULONG port = HwInit->FirstChannel + Channel;
+    ULONG T = 30000;                            /* ps */
+    ULONG clk[8], peer[8], index, shift = 4 * Unit, v, fifo;
+    BOOLEAN udma = (BOOLEAN)(dev->UseDma && dev->ModeType == IDE_MODE_UDMA);
+
+    if (port > 1) return;
+    /* UDMA: the PIO timing for the PIO commands, the UDMA code on top */
+    index = udma ? ((dev->PioMode > 4) ? 4 : dev->PioMode) : IdeModeIndex(dev);
+    IdeTimingClocks(index, (dev->PioMode > 4) ? 4 : dev->PioMode, T, T, clk);
+    if (pair->Present) {
+        ULONG pp = (pair->PioMode > 4) ? 4 : pair->PioMode;
+        IdeTimingClocks(pp, pp, T, T, peer);
+        if (peer[IDE_T_SETUP] > clk[IDE_T_SETUP]) clk[IDE_T_SETUP] = peer[IDE_T_SETUP];
+        if (peer[IDE_T_ACT8B] > clk[IDE_T_ACT8B]) clk[IDE_T_ACT8B] = peer[IDE_T_ACT8B];
+        if (peer[IDE_T_REC8B] > clk[IDE_T_REC8B]) clk[IDE_T_REC8B] = peer[IDE_T_REC8B];
+    }
+
+    /* FIFO: on for disks (PIO 05h, DMA 08h), off for ATAPI */
+    fifo = dev->IsAtapi ? 0x00 : (dev->UseDma ? 0x08 : 0x05);
+    v = IdePciReadConfig(HwInit, 0x54 + port, 1);
+    IdePciWriteConfig(HwInit, 0x54 + port, 1, (v & ~(0x0FUL << shift)) | (fifo << shift));
+
+    IdePciWriteConfig(HwInit, 0x58 + 4 * port, 1, IdeClamp(clk[IDE_T_SETUP], 1, 8) & 7);
+    IdePciWriteConfig(HwInit, 0x59 + 4 * port, 1,
+                      ((IdeClamp(clk[IDE_T_ACT8B], 1, 8) & 7) << 4) | (IdeClamp(clk[IDE_T_REC8B], 1, 16) & 15));
+    IdePciWriteConfig(HwInit, 0x5A + 4 * port + Unit, 1,
+                      ((IdeClamp(clk[IDE_T_ACTIVE], 1, 8) & 7) << 4) | (IdeClamp(clk[IDE_T_RECOVER], 1, 16) & 15));
+
+    v = IdePciReadConfig(HwInit, 0x56 + port, 1) & ~(0x0FUL << shift);
+    if (udma) {
+        v |= (ULONG)udmaCode[dev->Mode > 6 ? 6 : dev->Mode] << shift;
+        if (dev->Mode >= 3) IdePciWriteConfig(HwInit, 0x4B, 1, IdePciReadConfig(HwInit, 0x4B, 1) | 0x01);
+    }
+    IdePciWriteConfig(HwInit, 0x56 + port, 1, v);
+}
+
 /* Silicon Image: transfer mode field of the port (0 PIO 0-2, 1 PIO 3/4,
    2 MWDMA, 3 UDMA), one per device */
 static VOID
@@ -830,6 +1042,10 @@ IdeProgramHost(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
             if (dev->UseDma) IdeIntelSetDma(HwInit, port, Unit, dev->ModeType, dev->Mode, dev->PioMode);
         } else if (IDE_CHIP_IS_CMD(HwInit->Chip)) {
             IdeCmdSetHost(HwInit, Channel, Unit);
+        } else if (IDE_CHIP_IS_VIA_STYLE(HwInit->Chip)) {
+            IdeViaSetHost(HwInit, Channel, Unit);
+        } else if (HwInit->Chip == IDE_CHIP_ALI && HwInit->AliTiming) {
+            IdeAliSetHost(HwInit, Channel, Unit);
         }
     }
     if (IDE_CHIP_IS_SII(HwInit->Chip)) IdeSiiSetHost(HwInit, Channel);
@@ -879,6 +1095,15 @@ IdeHostProgrammable(IN PHW_DEVICE_EXTENSION HwInit, OUT PULONG UdmaMax)
         if (HwInit->SiiMmio == NULL) return FALSE;
         *UdmaMax = 6;                                       /* SATA link: no PATA timing */
         return TRUE;
+    case IDE_CHIP_VIA:
+    case IDE_CHIP_AMD:
+        if (HwInit->ViaBase == 0) return FALSE;            /* generation not known */
+        if (HwInit->ViaUdmaMax != 0xFF) *UdmaMax = HwInit->ViaUdmaMax;
+        return TRUE;
+    case IDE_CHIP_ALI:
+        if (!HwInit->AliTiming) return FALSE;
+        if (HwInit->AliUdmaMax != 0xFF) *UdmaMax = HwInit->AliUdmaMax;
+        return TRUE;
     default:
         return FALSE;
     }
@@ -891,7 +1116,47 @@ IdeHostCable80(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
     if (HwInit->Chip == IDE_CHIP_CMD648 || HwInit->Chip == IDE_CHIP_CMD649) {
         return (BOOLEAN)((IdePciReadConfig(HwInit, CMD_BMIDECSR, 1) & (1UL << Port)) != 0);
     }
+    if (HwInit->Chip == IDE_CHIP_VIA && HwInit->ViaBase != 0 && Port <= 1) {
+        if ((HwInit->ViaFlags & IDE_VIA_SATA_PATA) && Port == 0) return TRUE;
+        /* UDMA 100 and later: the drive-side cable bits the BIOS latched */
+        if (HwInit->ViaUdmaType >= 5) {
+            return (BOOLEAN)((IdePciReadConfig(HwInit, 0x50, 4) & (0x10100000UL >> (16 * Port))) != 0);
+        }
+        return FALSE;
+    }
+    if (HwInit->Chip == IDE_CHIP_ALI && HwInit->AliTiming && Port <= 1) {
+        /* C2h and later: 4Ah bit set per channel = 40 wires */
+        if (HwInit->Revision < 0xC2 || HwInit->AliCable40) return FALSE;
+        return (BOOLEAN)((IdePciReadConfig(HwInit, 0x4A, 1) & (1UL << Port)) == 0);
+    }
+    if (HwInit->Chip == IDE_CHIP_AMD && (HwInit->ViaFlags & IDE_VIA_AMD_CABLE) && Port <= 1) {
+        return (BOOLEAN)((IdePciReadConfig(HwInit, 0x42, 1) & (Port ? 0x0C : 0x03)) != 0);
+    }
+    if (HwInit->Chip == IDE_CHIP_AMD && (HwInit->ViaFlags & IDE_VIA_NVIDIA) && Port <= 1) {
+        /* nVidia: the cable detection is unreliable; a UDMA mode above 2
+           that the BIOS set means an 80-conductor cable */
+        ULONG b = HwInit->NvBiosUdma >> (Port ? 0 : 16), u;
+        for (u = 0; u < 2; u++) {
+            ULONG v = (b >> (u ? 0 : 8)) & 0xFF;
+            if ((v & 0xC0) == 0xC0 && ((v & 7) >= 4)) return TRUE;
+        }
+        return FALSE;
+    }
     return IdeIntelCable80(HwInit, Port);
+}
+
+/* Model string (IDENTIFY words 27-46) starting with Prefix */
+static BOOLEAN
+IdeModelStartsWith(IN PUSHORT Id, IN PCHAR Prefix)
+{
+    ULONG i;
+    CHAR c;
+
+    for (i = 0; i < 40 && Prefix[i] != 0; i++) {
+        c = (CHAR)((i & 1) ? (Id[27 + i / 2] & 0xFF) : (Id[27 + i / 2] >> 8));
+        if (c != Prefix[i]) return FALSE;
+    }
+    return TRUE;
 }
 
 /* Model string (IDENTIFY words 27-46) equal to Model, trailing blanks aside */
@@ -988,6 +1253,12 @@ IdeSelectTransferMode(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG
             IDE_DBG((IDE_PFX "Channel %lu.%lu: 15 sectors per command (Silicon Image 3112 errata)\n", Channel, Unit));
         }
     }
+    /* ALi 20h-C1h: no UDMA for WD drives; up to C4h at most 255 sectors
+       per command (Linux pata_ali) */
+    if (HwInit->Chip == IDE_CHIP_ALI && HwInit->Revision >= 0x20) {
+        if (HwInit->Revision < 0xC2 && IdeModelStartsWith(id, "WDC")) udma = IDE_NO_UDMA;
+        if (HwInit->Revision < 0xC5) dev->MaxSectors = 255;
+    }
     /* ServerWorks errata (Linux pata_serverworks): the OSB4 hangs with
        UDMA to disks, the CSB5/6 corrupts UDMA 5+ with some drives */
     if (!dev->IsAtapi && udma != IDE_NO_UDMA) {
@@ -1002,14 +1273,28 @@ IdeSelectTransferMode(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG
 
     if (ch->Bm == NULL) why = "no bus master";
     else if (!HwInit->DmaAllowed) why = "DMA off";
+    else if (ch->UnitsPio & (1U << Unit)) why = "PIO only (PIO=)";
     else if (dev->DmaErrors >= IDE_DMA_ERROR_LIMIT) why = "after DMA errors";
     else if (!(id[IDW_CAPABILITIES] & IDW49_DMA_SUPPORTED)) why = "device without DMA";
     else if (dev->IsAtapi && HwInit->NoAtapiDma) why = "no ATAPI DMA on this controller";
     else {
         bmsts = IDE_INB(ch->Bm + BM_REG_STATUS);
-        /* Simplex bus master: one channel at a time may use DMA; the
-           primary has it */
-        if ((bmsts & BM_STS_SIMPLEX) && port != 0) why = "simplex bus master, DMA on the primary channel";
+        if ((bmsts & BM_STS_SIMPLEX) && HwInit->ClearSimplex) {
+            /* AMD 756/766: not really simplex (interrupt and error bits
+               written as 0: left alone) */
+            IDE_OUTB(ch->Bm + BM_REG_STATUS, (UCHAR)(bmsts & 0x60));
+            bmsts = IDE_INB(ch->Bm + BM_REG_STATUS);
+        }
+        /* Simplex bus master: one channel at a time may use DMA. With both
+           channels in this adapter they take turns (IdeSimplexWait);
+           otherwise the primary has it. */
+        if (bmsts & BM_STS_SIMPLEX) {
+            if (HwInit->ChannelCount == 2 && HwInit->FirstChannel == 0) {
+                HwInit->Simplex = TRUE;
+            } else if (port != 0) {
+                why = "simplex bus master, DMA on the primary channel";
+            }
+        }
     }
     if (why != NULL) {
         if (pio >= 3) IdeSetXferMode(HwInit, Channel, Unit, IDE_MODE_PIO, pio);
@@ -1165,6 +1450,17 @@ IdeDisableDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG Unit)
 /* Interrupt-completed DMA                                             */
 /* ------------------------------------------------------------------ */
 
+/* Simplex bus master: DMA on the other channel finished first */
+static VOID
+IdeSimplexWait(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
+{
+    PIDE_CHANNEL other;
+
+    if (!HwInit->Simplex || HwInit->ChannelCount != 2) return;
+    other = &HwInit->Channels[Channel ^ 1];
+    if (other->Outstanding != NULL && !other->ActivePio) IdeDrainChannel(HwInit, Channel ^ 1);
+}
+
 /* Start a DMA read/write and return; HwInterrupt (or the watchdog)
    completes it. Returns SRB_STATUS_PENDING, otherwise the status to
    complete the SRB with. */
@@ -1175,6 +1471,7 @@ IdeIssueDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_B
     ULONG timeoutUsec;
 
     if (ch->Outstanding != NULL) return SRB_STATUS_BUSY;
+    IdeSimplexWait(HwInit, Channel);
     IdeChannelAlive(HwInit, Channel);
     if (!IdeBusMasterAlive(HwInit, Channel)) return SRB_STATUS_BUSY;  /* retried, with PIO */
 
@@ -1206,8 +1503,189 @@ IdeIssueDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_B
     ch->ActiveUnit = Req->Unit;
     ch->ActiveWrite = Req->IsWrite;
     ch->ActiveAtapi = Req->IsAtapi;
+    ch->ActivePio = FALSE;
     IDE_OUTB(ch->Bm + BM_REG_COMMAND, (Req->IsWrite ? 0 : BM_CMD_READ) | BM_CMD_START);
     return SRB_STATUS_PENDING;
+}
+
+/* Start a PIO or non-data command and return; the interrupt moves each
+   DRQ block and completes it (an ATA write's first block goes out here,
+   it raises no interrupt). Returns SRB_STATUS_PENDING, otherwise the
+   status to complete the SRB with (SRB_STATUS_INVALID_REQUEST: run it
+   polled instead). */
+UCHAR
+IdeIssuePio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    ULONG timeoutUsec = IdeTimeoutUsec(Srb, Req);
+    UCHAR status;
+
+    if (Req->UseBounce || Req->UseDma) return SRB_STATUS_INVALID_REQUEST;
+    if (ch->Outstanding != NULL) return SRB_STATUS_BUSY;
+    IdeChannelAlive(HwInit, Channel);
+
+    if (!IdePrepareDevice(ch, Req->Unit)) {
+        IDE_DBG((IDE_PFX "Channel %lu.%lu: device busy before command %02lX (status %02lX)\n",
+                 Channel, (ULONG)Req->Unit, (ULONG)Req->Command, (ULONG)IdeAltStatus(ch)));
+        IdeResetChannel(HwInit, Channel);
+        return SRB_STATUS_BUS_RESET;
+    }
+
+    ch->PioBuffer = (PUCHAR)Req->DataBuffer;
+    ch->PioLeft = (Req->DataBuffer != NULL) ? Req->DataBufferLen : 0;
+    ch->PioTail = FALSE;
+    ch->ActiveUnit = Req->Unit;
+    ch->ActiveWrite = Req->IsWrite;
+    ch->ActiveAtapi = Req->IsAtapi;
+    ch->ActiveIs48 = Req->Is48Bit;
+
+    IdeSetControl(ch, 0);                       /* interrupts on */
+    IdeWriteTaskFile(ch, Req, FALSE);
+    /* BSY is valid 400 ns after the command; until then the status may
+       still be the previous one, which would look like the end */
+    ScsiPortStallExecution(1);
+
+    if (Req->IsAtapi || (Req->IsWrite && ch->PioLeft != 0)) {
+        if (Req->IsAtapi) {
+            if (IdeSendPacket(ch, Req, timeoutUsec)) goto issued;
+        } else if (IdeWaitStatus(ch, IDE_STS_BSY, 0, timeoutUsec)) {
+            status = IdeAltStatus(ch);
+            if ((status & (IDE_STS_DRQ | IDE_STS_ERR)) == IDE_STS_DRQ) {
+                IdePioBlock(ch, FALSE, TRUE, &ch->PioBuffer, &ch->PioLeft, IDE_SECTOR_SIZE);
+                goto issued;
+            }
+        }
+        status = IDE_INB(ch->Cmd + IDE_REG_STATUS);
+        IdeSetControl(ch, IDE_CTL_NIEN);
+        IdeReadResult(ch, Req->Is48Bit, status);
+        ch->Devices[Req->Unit].LastStatus = status;
+        ch->Devices[Req->Unit].LastError = ch->Result.Error;
+        if (IDE_CHIP_IS_CMD(HwInit->Chip)) IdeChipClearInterrupt(HwInit, Channel);
+        if (!(status & IDE_STS_ERR) || (status & (IDE_STS_BSY | IDE_STS_DRQ))) IdeResetChannel(HwInit, Channel);
+        return SRB_STATUS_ERROR;
+    }
+
+issued:
+    ch->ActivePio = TRUE;
+    ch->Outstanding = Srb;
+    return SRB_STATUS_PENDING;
+}
+
+/* The PIO command in flight ended (or failed) */
+static VOID
+IdeFinishPio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UCHAR Status, IN ULONG Result)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PIDE_DEVICE dev = &ch->Devices[ch->ActiveUnit];
+    PSCSI_REQUEST_BLOCK srb = ch->Outstanding;
+
+    IdeSetControl(ch, IDE_CTL_NIEN);
+    if (IDE_CHIP_IS_CMD(HwInit->Chip)) IdeChipClearInterrupt(HwInit, Channel);
+    if (Result != IDE_CMD_OK || (Status & (IDE_STS_ERR | IDE_STS_DF))) {
+        IdeReadResult(ch, ch->ActiveIs48, Status);
+    } else {
+        ch->Result.Status = Status;
+        ch->Result.Error = 0;
+    }
+    dev->LastStatus = Status;
+    dev->LastError = ch->Result.Error;
+    if (Result != IDE_CMD_OK) {
+        IDE_DBG((IDE_PFX "Channel %lu.%lu: PIO command failed, status %02lX error %02lX, %lu bytes left\n",
+                 Channel, (ULONG)ch->ActiveUnit, (ULONG)Status, (ULONG)ch->Result.Error, ch->PioLeft));
+        if (Status & (IDE_STS_BSY | IDE_STS_DRQ)) IdeResetChannel(HwInit, Channel);
+    }
+    ch->Outstanding = NULL;
+    ch->ActivePio = FALSE;
+    ch->PioTail = FALSE;
+    IdeSatlCompleteDma(HwInit, Channel, srb, Result);
+    IdeStartQueued(HwInit, Channel);
+}
+
+/* An interrupt (or the watchdog) for the PIO command in flight: the next
+   DRQ block, or the end. Returns 1 when the device had something for us
+   that an interrupt reported (or should have). */
+static ULONG
+IdeServicePio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN BOOLEAN FromInterrupt)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    UCHAR status, reason;
+    ULONG t;
+    BOOLEAN tail = ch->PioTail;
+
+    status = IdeAltStatus(ch);
+    if (status & IDE_STS_BSY) return 0;
+    status = IDE_INB(ch->Cmd + IDE_REG_STATUS);          /* drops INTRQ */
+
+    if (status & (IDE_STS_ERR | IDE_STS_DF)) {
+        IdeFinishPio(HwInit, Channel, status, (status & IDE_STS_ERR) ? IDE_CMD_DEVICE_ERROR : IDE_CMD_HBA_ERROR);
+        return 1;
+    }
+    if (!(status & IDE_STS_DRQ)) {
+        /* Done. An ATA transfer that stopped short is an error. */
+        IdeFinishPio(HwInit, Channel, status,
+                     (ch->PioLeft != 0 && !ch->ActiveAtapi) ? IDE_CMD_HBA_ERROR : IDE_CMD_OK);
+        return (ULONG)(tail ? 0 : 1);
+    }
+
+    if (ch->ActiveAtapi) {
+        reason = IDE_INB(ch->Cmd + IDE_REG_COUNT);
+        if (reason & 0x01) {                    /* wants a packet again: not ours */
+            IdeFinishPio(HwInit, Channel, status, IDE_CMD_HBA_ERROR);
+            return 1;
+        }
+        IdePioBlock(ch, TRUE, ch->ActiveWrite, &ch->PioBuffer, &ch->PioLeft, 0);
+        IdeAltStatus(ch);
+        return 1;
+    }
+
+    for (;;) {
+        if (ch->PioLeft == 0) {                 /* offers data we did not ask for */
+            IdeFinishPio(HwInit, Channel, status, IDE_CMD_HBA_ERROR);
+            return 1;
+        }
+        IdePioBlock(ch, FALSE, ch->ActiveWrite, &ch->PioBuffer, &ch->PioLeft, IDE_SECTOR_SIZE);
+        if (ch->PioLeft == 0) break;
+        /* The next block is often ready within microseconds: taken at
+           once instead of waiting for its interrupt (reading the status
+           drops that interrupt again) */
+        IdeAltStatus(ch);
+        for (t = 0; t < IDE_PIO_SPIN_USEC; t++) {
+            status = IdeAltStatus(ch);
+            if (!(status & IDE_STS_BSY)) break;
+            ScsiPortStallExecution(1);
+        }
+        if (status & IDE_STS_BSY) return 1;
+        status = IDE_INB(ch->Cmd + IDE_REG_STATUS);
+        if (status & (IDE_STS_ERR | IDE_STS_DF)) {
+            IdeFinishPio(HwInit, Channel, status, (status & IDE_STS_ERR) ? IDE_CMD_DEVICE_ERROR : IDE_CMD_HBA_ERROR);
+            return 1;
+        }
+        if (!(status & IDE_STS_DRQ)) {
+            IdeFinishPio(HwInit, Channel, status, IDE_CMD_HBA_ERROR);
+            return 1;
+        }
+    }
+    if (!ch->ActiveWrite) {
+        /* Last block of a read: no interrupt follows. The device drops BSY
+           within microseconds; otherwise the watchdog completes it. */
+        for (t = 0; t < 100; t++) {
+            status = IdeAltStatus(ch);
+            if (!(status & IDE_STS_BSY)) break;
+            ScsiPortStallExecution(1);
+        }
+        if (!(status & IDE_STS_BSY)) {
+            status = IDE_INB(ch->Cmd + IDE_REG_STATUS);
+            IdeFinishPio(HwInit, Channel, status,
+                         (status & IDE_STS_ERR) ? IDE_CMD_DEVICE_ERROR :
+                         (status & (IDE_STS_DRQ | IDE_STS_DF)) ? IDE_CMD_HBA_ERROR : IDE_CMD_OK);
+        } else {
+            ch->PioTail = TRUE;
+        }
+        return 1;
+    }
+    IdeAltStatus(ch);
+    (VOID)FromInterrupt;
+    return 1;
 }
 
 /* Complete the DMA command on the channel if the hardware is done with
@@ -1221,7 +1699,9 @@ IdeServiceChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN BOOLEAN F
     UCHAR bmsts, status;
     ULONG result = IDE_CMD_OK;
 
-    if (srb == NULL || ch->Bm == NULL) return 0;
+    if (srb == NULL) return 0;
+    if (ch->ActivePio) return IdeServicePio(HwInit, Channel, FromInterrupt);
+    if (ch->Bm == NULL) return 0;
 
     bmsts = IDE_INB(ch->Bm + BM_REG_STATUS);
     status = IdeAltStatus(ch);
@@ -1243,7 +1723,12 @@ IdeServiceChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN BOOLEAN F
     if (IDE_CHIP_IS_CMD(HwInit->Chip)) IdeChipClearInterrupt(HwInit, Channel);
 
     dev = &ch->Devices[ch->ActiveUnit];
-    IdeReadResult(ch, FALSE, status);
+    if ((status & (IDE_STS_ERR | IDE_STS_DRQ | IDE_STS_DF)) || (bmsts & BM_STS_ERROR)) {
+        IdeReadResult(ch, FALSE, status);
+    } else {
+        ch->Result.Status = status;
+        ch->Result.Error = 0;
+    }
     dev->LastStatus = status;
     dev->LastError = ch->Result.Error;
 
@@ -1268,13 +1753,35 @@ IdeServiceChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN BOOLEAN F
     ch->Outstanding = NULL;
     IdeSatlCompleteDma(HwInit, Channel, srb, result);
 
-    /* The request that waited for the channel */
-    if (ch->Pending != NULL) {
-        PSCSI_REQUEST_BLOCK next = ch->Pending;
-        ch->Pending = NULL;
+    /* The requests that waited for the channel */
+    IdeStartQueued(HwInit, Channel);
+    return 1;
+}
+
+/* Start the queued requests in order until one is in flight; ScsiPort
+   is asked for more for the units it was held back from */
+VOID
+IdeStartQueued(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    PSCSI_REQUEST_BLOCK next;
+    ULONG unit;
+
+    while (ch->Outstanding == NULL && ch->QueueCount != 0) {
+        next = ch->Queue[ch->QueueHead];
+        ch->Queue[ch->QueueHead] = NULL;
+        ch->QueueHead = (UCHAR)((ch->QueueHead + 1) % IDE_QUEUE_DEPTH);
+        ch->QueueCount--;
         IdeSatlStartPending(HwInit, Channel, next);
     }
-    return 1;
+    if (ch->LuBlocked != 0 && ch->QueueCount < IDE_QUEUE_DEPTH) {
+        for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+            if (!(ch->LuBlocked & (1 << unit))) continue;
+            ch->LuBlocked &= (UCHAR)~(1 << unit);
+            ScsiPortNotification(NextLuRequest, HwInit, 0,
+                                 (UCHAR)((Channel * IDE_DEVICES_PER_CHANNEL) + unit), 0);
+        }
+    }
 }
 
 /* Poll until the DMA command on the channel is finished */
@@ -1293,12 +1800,11 @@ IdeDrainChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
             IdeResetChannel(HwInit, Channel);
             break;
         }
-        ScsiPortStallExecution(IDE_POLL_INTERVAL_USEC);
-        elapsed += IDE_POLL_INTERVAL_USEC;
+        IDE_POLL_STEP(elapsed, 1);
     }
 }
 
-/* Give the in-flight and the waiting request back to ScsiPort */
+/* Give the in-flight and the waiting requests back to ScsiPort */
 VOID
 IdeFailOutstanding(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UCHAR SrbStatus)
 {
@@ -1311,14 +1817,28 @@ IdeFailOutstanding(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UCHAR Sr
     }
     srb = ch->Outstanding;
     ch->Outstanding = NULL;
+    ch->ActivePio = FALSE;
+    ch->PioTail = FALSE;
     if (srb != NULL) {
         srb->SrbStatus = SrbStatus;
         ScsiPortNotification(RequestComplete, HwInit, srb);
     }
-    srb = ch->Pending;
-    ch->Pending = NULL;
-    if (srb != NULL) {
+    while (ch->QueueCount != 0) {
+        srb = ch->Queue[ch->QueueHead];
+        ch->Queue[ch->QueueHead] = NULL;
+        ch->QueueHead = (UCHAR)((ch->QueueHead + 1) % IDE_QUEUE_DEPTH);
+        ch->QueueCount--;
         srb->SrbStatus = SrbStatus;
         ScsiPortNotification(RequestComplete, HwInit, srb);
+    }
+    if (ch->LuBlocked != 0) {
+        ULONG unit;
+        for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) {
+            if (ch->LuBlocked & (1 << unit)) {
+                ScsiPortNotification(NextLuRequest, HwInit, 0,
+                                     (UCHAR)((Channel * IDE_DEVICES_PER_CHANNEL) + unit), 0);
+            }
+        }
+        ch->LuBlocked = 0;
     }
 }

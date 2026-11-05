@@ -1,14 +1,18 @@
 /*
- * IDENT - IRP_MJ_PNP start-device hook for Windows 2000/XP
+ * IDENT - IRP_MJ_PNP and IRP_MJ_DEVICE_CONTROL front ends for Windows 2000/XP
  *
  * A PCI IDE function in compatibility mode raises ISA IRQ 14 and 15, which
  * the PCI bus driver does not report as its resources. ScsiPort refuses to
  * start a PCI adapter whose resource list has no interrupt, so the start
  * IRP of such a function gets IRQ 14 added on its way to ScsiPort: the raw
  * list the bus-relative number, the translated list what the HAL gives for
- * ISA IRQ 14. ScsiPort connects one interrupt for a PnP adapter, so the
- * secondary channel runs with Fast Polling. A native-mode function brings
- * its own BARs and interrupt and is passed on unchanged.
+ * ISA IRQ 14. ScsiPort connects one interrupt for a PnP adapter; on x86
+ * and x64 the driver connects IRQ 15 itself once the adapter has started
+ * and runs ScsiPort's interrupt routine for it under ScsiPort's interrupt
+ * lock, as ScsiPort does for the second interrupt of a non-PnP adapter
+ * (see IdeConnectSecondary).
+ * A native-mode function brings its own BARs and interrupt and is passed
+ * on unchanged.
  *
  * The resource requirements of a native-mode function are kept off the
  * legacy ports while a compatibility-mode function decodes them: a BIOS
@@ -18,10 +22,15 @@
  */
 
 #include <ntddk.h>
+#include <srb.h>
+#include <ntddscsi.h>
 
 /* Not in every DDK's header for every platform; exported by every HAL */
 ULONG NTAPI HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber, ULONG BusInterruptLevel,
                                   ULONG BusInterruptVector, PKIRQL Irql, PKAFFINITY Affinity);
+
+/* idemain.c: the secondary channel's interrupt on or off (synchronized) */
+BOOLEAN IdeSecondaryInterrupt(IN PVOID HwInit, IN BOOLEAN On);
 
 #define IDE_PNP_POOL_TAG        ((ULONG)'I' | ((ULONG)'D' << 8) | ((ULONG)'N' << 16) | ((ULONG)'T' << 24))
 
@@ -36,8 +45,30 @@ typedef struct _IDE_PNP_LISTS {
 #define IDE_PNP_LIST_SLOTS      8
 static IDE_PNP_LISTS g_IdePnpLists[IDE_PNP_LIST_SLOTS];
 
+/* The secondary channel's IRQ 15 of a started compatibility-mode adapter */
+typedef BOOLEAN (NTAPI *IDE_ISR)(PKINTERRUPT Interrupt, PVOID Context);
+typedef struct _IDE_SECOND_IRQ {
+    PDEVICE_OBJECT     Device;
+    PVOID              HwInit;
+    PKINTERRUPT        Ours;
+    PKINTERRUPT        ScsiInterrupt;
+    IDE_ISR            ScsiIsr;
+    PVOID              ScsiContext;
+    BOOLEAN            Deferred;        /* IRQ 15 above ScsiPort's level: through a DPC */
+    BOOLEAN            Active;
+    LONG               DpcBusy;
+    KDPC               Dpc;
+} IDE_SECOND_IRQ;
+
+static IDE_SECOND_IRQ g_IdeSecondIrq[IDE_PNP_LIST_SLOTS];
+static PDEVICE_OBJECT g_IdeStartingDevice;
+static PVOID g_IdeStartingHwInit;
+
+static VOID IdeConnectSecondary(IN PDEVICE_OBJECT Device, IN PVOID HwInit);
+static VOID IdeDisconnectSecondary(IN PDEVICE_OBJECT Device);
+
 /* The primary channel's IRQ only: ScsiPort connects one interrupt for a
-   PnP adapter, the secondary channel runs with Fast Polling */
+   PnP adapter; IRQ 15 is connected after the start (IdeConnectSecondary) */
 #define IDE_LEGACY_IRQ_COUNT    1
 static const ULONG g_IdeLegacyIrq[IDE_LEGACY_IRQ_COUNT] = { 14 };
 
@@ -326,6 +357,8 @@ static NTSTATUS NTAPI
 IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    UCHAR minor = stack->MinorFunction;
+    BOOLEAN compatStart = FALSE;
     NTSTATUS status;
 
     if (stack->MinorFunction == IRP_MN_FILTER_RESOURCE_REQUIREMENTS) {
@@ -370,6 +403,7 @@ IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
                 added = &IdeDescriptors(newTranslated)[IdeDescriptorCount(newTranslated) - 1];
                 DbgPrint("[IDENT] PnP start: compatibility mode, IRQ 14 connected (vector %lX, IRQL %lu)\n",
                          added->u.Interrupt.Vector, added->u.Interrupt.Level);
+                compatStart = TRUE;
             } else {
                 if (newRaw != NULL) ExFreePool(newRaw);
                 if (newTranslated != NULL) ExFreePool(newTranslated);
@@ -377,19 +411,379 @@ IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
         }
     }
 
+    if (minor == IRP_MN_STOP_DEVICE || minor == IRP_MN_REMOVE_DEVICE || minor == IRP_MN_SURPRISE_REMOVAL) {
+        IdeDisconnectSecondary(Device);
+    }
+    if (compatStart) {
+        IdeDisconnectSecondary(Device);
+        g_IdeStartingHwInit = NULL;
+        g_IdeStartingDevice = Device;
+    }
+
     status = g_IdeOrigPnp(Device, Irp);
 
-    if (stack->MinorFunction == IRP_MN_REMOVE_DEVICE) IdeFreePnpLists(Device);
+    if (compatStart) {
+        /* ScsiPort starts the adapter within the IRP (HwFindAdapter,
+           its interrupt, HwInitialize) */
+        if (NT_SUCCESS(status) && status != STATUS_PENDING && g_IdeStartingHwInit != NULL) {
+            IdeConnectSecondary(Device, g_IdeStartingHwInit);
+        }
+        g_IdeStartingDevice = NULL;
+        g_IdeStartingHwInit = NULL;
+    }
+    if (minor == IRP_MN_REMOVE_DEVICE) IdeFreePnpLists(Device);
     return status;
 }
 
-/* After ScsiPortInitialize: ScsiPort's IRP_MJ_PNP entry gets a front end */
+/* ------------------------------------------------------------------ */
+/* IRQ 15 for the secondary channel                                    */
+/* ------------------------------------------------------------------ */
+
+/* HwFindAdapter of a compatibility-mode function started through the
+   hooked start IRP: the adapter whose IRQ 15 is connected afterwards */
+VOID
+IdePnpNoteAdapter(IN PVOID HwInit)
+{
+    if (g_IdeStartingDevice != NULL) g_IdeStartingHwInit = HwInit;
+}
+
+#if defined(_WIN64) && (defined(_AMD64_) || defined(_M_AMD64) || defined(__x86_64__))
+/* KINTERRUPT of Server 2003 SP1 / XP x64 (KeInitializeInterrupt of 3790.1830) */
+#define IDE_SECOND_IRQ_HOOK     1
+#define IDE_KI_TYPE             0x00        /* SHORT, 22 = InterruptObject */
+#define IDE_KI_SIZE             0x02
+#define IDE_KI_SERVICE_ROUTINE  0x18
+#define IDE_KI_SERVICE_CONTEXT  0x20
+#define IDE_KI_ACTUAL_LOCK      0x38
+#define IDE_KI_VECTOR           0x48
+#define IDE_KI_IRQL             0x4C
+#define IDE_KI_SYNC_IRQL        0x4D
+#define IDE_KI_CONNECTED        0x4F
+#define IDE_KI_MIN_SIZE         0x58
+#define IDE_KI_TYPE_INTERRUPT   22
+#elif defined(_X86_) && !defined(_WIN64)
+/* KINTERRUPT of NT 4.0 to Server 2003 x86 */
+#define IDE_SECOND_IRQ_HOOK     1
+#define IDE_KI_TYPE             0x00        /* SHORT, 22 = InterruptObject */
+#define IDE_KI_SIZE             0x02
+#define IDE_KI_SERVICE_ROUTINE  0x0C
+#define IDE_KI_SERVICE_CONTEXT  0x10
+#define IDE_KI_ACTUAL_LOCK      0x1C
+#define IDE_KI_VECTOR           0x24
+#define IDE_KI_IRQL             0x28
+#define IDE_KI_SYNC_IRQL        0x29
+#define IDE_KI_CONNECTED        0x2B
+#define IDE_KI_MIN_SIZE         0x30
+#define IDE_KI_TYPE_INTERRUPT   22
+#endif
+
+#ifdef IDE_SECOND_IRQ_HOOK
+
+/* ScsiPort's interrupt routine, called under its interrupt lock */
+static BOOLEAN NTAPI
+IdeSecondScsiIsr(IN PVOID Context)
+{
+    IDE_SECOND_IRQ *e = (IDE_SECOND_IRQ *)Context;
+    return e->ScsiIsr(e->ScsiInterrupt, e->ScsiContext);
+}
+
+static BOOLEAN NTAPI
+IdeSecondIsr(IN PKINTERRUPT Interrupt, IN PVOID Context)
+{
+    IDE_SECOND_IRQ *e = (IDE_SECOND_IRQ *)Context;
+    (VOID)Interrupt;
+    if (!e->Deferred) {
+        /* Connected with ScsiPort's lock at its level: as for its own line */
+        return IdeSecondScsiIsr(e);
+    }
+    /* IRQ 15 above ScsiPort's level: the line is ours alone (edge, not
+       shared), ScsiPort's routine follows at its level from a DPC; the
+       channel's INTRQ stays until its status register is read there */
+    if (e->Active) KeInsertQueueDpc(&e->Dpc, NULL, NULL);
+    return TRUE;
+}
+
+static VOID NTAPI
+IdeSecondDpc(IN PKDPC Dpc, IN PVOID Context, IN PVOID A1, IN PVOID A2)
+{
+    IDE_SECOND_IRQ *e = (IDE_SECOND_IRQ *)Context;
+    (VOID)Dpc; (VOID)A1; (VOID)A2;
+    InterlockedIncrement(&e->DpcBusy);
+    if (e->Active) KeSynchronizeExecution(e->ScsiInterrupt, IdeSecondScsiIsr, e);
+    InterlockedDecrement(&e->DpcBusy);
+}
+
+static BOOLEAN NTAPI
+IdeSecondOn(IN PVOID Context)
+{
+    return IdeSecondaryInterrupt(((IDE_SECOND_IRQ *)Context)->HwInit, TRUE);
+}
+
+static BOOLEAN NTAPI
+IdeSecondOff(IN PVOID Context)
+{
+    return IdeSecondaryInterrupt(((IDE_SECOND_IRQ *)Context)->HwInit, FALSE);
+}
+
+/* ScsiPort's interrupt object of the adapter: a pointer in its device
+   extension (the miniport's extension is preceded by a pointer to it)
+   to an interrupt object connected to IRQ 14 for this device object.
+   Each candidate is checked to be readable memory before it is read. */
+static PUCHAR
+IdeFindScsiInterrupt(IN PDEVICE_OBJECT Device, IN PVOID HwInit, IN ULONG Vector, IN KIRQL Irql)
+{
+    PUCHAR fdo, ki;
+    ULONG off;
+
+    if (!MmIsAddressValid((PUCHAR)HwInit - sizeof(PVOID))) return NULL;
+    fdo = *(PUCHAR *)((PUCHAR)HwInit - sizeof(PVOID));
+    if (fdo == NULL) return NULL;
+    for (off = 0; off < 0x600; off += sizeof(PVOID)) {
+        if (!MmIsAddressValid(fdo + off) || !MmIsAddressValid(fdo + off + sizeof(PVOID) - 1)) return NULL;
+        ki = *(PUCHAR *)(fdo + off);
+        if (ki == NULL || ((ULONG_PTR)ki & (sizeof(PVOID) - 1)) != 0) continue;
+        if (!MmIsAddressValid(ki) || !MmIsAddressValid(ki + IDE_KI_MIN_SIZE - 1)) continue;
+        if (*(PSHORT)(ki + IDE_KI_TYPE) != IDE_KI_TYPE_INTERRUPT) continue;
+        if (*(PSHORT)(ki + IDE_KI_SIZE) < IDE_KI_MIN_SIZE) continue;
+        if (*(PULONG)(ki + IDE_KI_VECTOR) != Vector || *(PUCHAR)(ki + IDE_KI_IRQL) != Irql) continue;
+        if (*(PUCHAR)(ki + IDE_KI_CONNECTED) != 1) continue;
+        if (*(PDEVICE_OBJECT *)(ki + IDE_KI_SERVICE_CONTEXT) != Device) continue;
+        return ki;
+    }
+    return NULL;
+}
+
+/* The adapter has started: IRQ 15 connected. Where its level is no
+   higher than ScsiPort's synchronization level, with ScsiPort's lock, and
+   ScsiPort's interrupt routine runs from it directly. Above that level
+   (APIC HALs) the lock could be taken on a processor that holds it
+   already (ScsiPort's routines hold it at their level), so the interrupt
+   only queues a DPC, which runs ScsiPort's routine synchronized with its
+   interrupt. Not done: the secondary channel stays with Fast Polling, as
+   before. */
+static VOID
+IdeConnectSecondary(IN PDEVICE_OBJECT Device, IN PVOID HwInit)
+{
+    IDE_SECOND_IRQ *e = NULL;
+    PUCHAR ki;
+    KIRQL irql14 = 0, irql15 = 0, sync;
+    KAFFINITY aff14 = 0, aff15 = 0;
+    ULONG vector14, vector15, i;
+    NTSTATUS status;
+
+    for (i = 0; i < IDE_PNP_LIST_SLOTS; i++) {
+        if (g_IdeSecondIrq[i].Device == NULL) { e = &g_IdeSecondIrq[i]; break; }
+    }
+    if (e == NULL) return;
+    vector14 = HalGetInterruptVector(Isa, 0, 14, 14, &irql14, &aff14);
+    vector15 = HalGetInterruptVector(Isa, 0, 15, 15, &irql15, &aff15);
+    if (vector15 == 0 || aff15 == 0) {
+        DbgPrint("[IDENT] PnP start: no vector for IRQ 15, secondary channel with Fast Polling\n");
+        return;
+    }
+    ki = IdeFindScsiInterrupt(Device, HwInit, vector14, irql14);
+    if (ki == NULL) {
+        DbgPrint("[IDENT] PnP start: ScsiPort's interrupt not found, secondary channel with Fast Polling\n");
+        return;
+    }
+    sync = *(PUCHAR)(ki + IDE_KI_SYNC_IRQL);
+    IdePnpZero(e, sizeof(*e));
+    e->ScsiInterrupt = (PKINTERRUPT)ki;
+    e->ScsiIsr = *(IDE_ISR *)(ki + IDE_KI_SERVICE_ROUTINE);
+    e->ScsiContext = *(PVOID *)(ki + IDE_KI_SERVICE_CONTEXT);
+    e->HwInit = HwInit;
+    e->Deferred = (BOOLEAN)(irql15 > sync);
+    KeInitializeDpc(&e->Dpc, IdeSecondDpc, e);
+    e->Active = TRUE;
+    if (e->Deferred) {
+        status = IoConnectInterrupt(&e->Ours, IdeSecondIsr, e, NULL, vector15, irql15, irql15,
+                                    Latched, FALSE, aff15, FALSE);
+    } else {
+        status = IoConnectInterrupt(&e->Ours, IdeSecondIsr, e, *(PKSPIN_LOCK *)(ki + IDE_KI_ACTUAL_LOCK),
+                                    vector15, irql15, sync, Latched, FALSE, aff15, FALSE);
+    }
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[IDENT] PnP start: IRQ 15 not connected (%08lX), secondary channel with Fast Polling\n", status);
+        IdePnpZero(e, sizeof(*e));
+        return;
+    }
+    e->Device = Device;
+    if (!KeSynchronizeExecution(e->ScsiInterrupt, IdeSecondOn, e)) {
+        e->Active = FALSE;
+        IoDisconnectInterrupt(e->Ours);
+        KeRemoveQueueDpc(&e->Dpc);
+        while (e->DpcBusy != 0) KeStallExecutionProcessor(10);
+        IdePnpZero(e, sizeof(*e));
+        DbgPrint("[IDENT] PnP start: secondary channel with Fast Polling (interrupts off)\n");
+        return;
+    }
+    DbgPrint("[IDENT] PnP start: IRQ 15 connected (vector %lX, IRQL %lu%s), secondary channel interrupt-driven\n",
+             vector15, (ULONG)irql15, e->Deferred ? ", through a DPC" : "");
+}
+
+/* Stop or removal: our IRQ 15 off before ScsiPort lets go of its
+   interrupt (and its lock) */
+static VOID
+IdeDisconnectSecondary(IN PDEVICE_OBJECT Device)
+{
+    ULONG i;
+
+    for (i = 0; i < IDE_PNP_LIST_SLOTS; i++) {
+        IDE_SECOND_IRQ *e = &g_IdeSecondIrq[i];
+        if (e->Device != Device || e->Ours == NULL) continue;
+        KeSynchronizeExecution(e->ScsiInterrupt, IdeSecondOff, e);
+        e->Active = FALSE;
+        IoDisconnectInterrupt(e->Ours);
+        KeRemoveQueueDpc(&e->Dpc);
+        while (e->DpcBusy != 0) KeStallExecutionProcessor(10);
+        IdePnpZero(e, sizeof(*e));
+        DbgPrint("[IDENT] PnP: IRQ 15 disconnected\n");
+    }
+}
+#else
+static VOID
+IdeConnectSecondary(IN PDEVICE_OBJECT Device, IN PVOID HwInit)
+{
+    (VOID)Device;
+    (VOID)HwInit;
+}
+
+static VOID
+IdeDisconnectSecondary(IN PDEVICE_OBJECT Device)
+{
+    (VOID)Device;
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/* IOCTL_SCSI_MINIPORT sent to a disk's PDO                            */
+/* ------------------------------------------------------------------ */
+
+/* disk.sys sends its SMART requests (SMART_GET_VERSION, SMART_RCV_DRIVE_DATA,
+   SMART_SEND_DRIVE_COMMAND and its own failure prediction) as
+   IOCTL_SCSI_MINIPORT to the disk's PDO. ScsiPort of Server 2003 / XP x64
+   answers that IOCTL on a PDO with STATUS_INVALID_DEVICE_REQUEST (only the
+   adapter's device object takes it). The front end turns it into the
+   SRB_FUNCTION_IO_CONTROL request ScsiPort builds for the adapter, sent
+   through the PDO, which puts the disk's address into it. Same on every
+   2000/XP version: the miniport sees the request as before. */
+static PDRIVER_DISPATCH g_IdeOrigDeviceControl;
+
+static NTSTATUS NTAPI
+IdePdoIoctlDone(IN PDEVICE_OBJECT Device, IN PIRP Irp, IN PVOID Context)
+{
+    (VOID)Device;
+    (VOID)Irp;
+    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static NTSTATUS
+IdePdoMiniportIoctl(IN PDEVICE_OBJECT Device, IN PIRP Irp)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp), next;
+    PSRB_IO_CONTROL ctl = (PSRB_IO_CONTROL)Irp->AssociatedIrp.SystemBuffer;
+    ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    PSCSI_REQUEST_BLOCK srb;
+    ULONG length;
+    KEVENT event;
+    PMDL mdl;
+    NTSTATUS status;
+    PIRP irp;
+
+    if (ctl == NULL || inLen < sizeof(SRB_IO_CONTROL)) {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (ctl->HeaderLength != sizeof(SRB_IO_CONTROL)) {
+        status = STATUS_REVISION_MISMATCH;
+        goto done;
+    }
+    length = ctl->HeaderLength + ctl->Length;
+    if (length < ctl->Length) {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (inLen < length && outLen < length) {
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+    srb = (PSCSI_REQUEST_BLOCK)ExAllocatePoolWithTag(NonPagedPool, sizeof(SCSI_REQUEST_BLOCK), IDE_PNP_POOL_TAG);
+    irp = IoAllocateIrp(Device->StackSize, FALSE);
+    /* ScsiPort maps the data of a request through the IRP's MDL: one for
+       the buffered IOCTL's system buffer (nonpaged pool) */
+    mdl = (irp != NULL) ? IoAllocateMdl(ctl, length, FALSE, FALSE, irp) : NULL;
+    if (srb == NULL || irp == NULL || mdl == NULL) {
+        if (srb != NULL) ExFreePool(srb);
+        if (mdl != NULL) IoFreeMdl(mdl);
+        if (irp != NULL) { irp->MdlAddress = NULL; IoFreeIrp(irp); }
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto done;
+    }
+    MmBuildMdlForNonPagedPool(mdl);
+    IdePnpZero(srb, sizeof(*srb));
+    srb->Length = sizeof(SCSI_REQUEST_BLOCK);
+    srb->Function = SRB_FUNCTION_IO_CONTROL;
+    srb->SrbFlags = SRB_FLAGS_DATA_IN | SRB_FLAGS_DATA_OUT | SRB_FLAGS_NO_QUEUE_FREEZE;
+    srb->DataBuffer = ctl;
+    srb->DataTransferLength = length;
+    srb->TimeOutValue = ctl->Timeout;
+    srb->OriginalRequest = irp;
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+    next = IoGetNextIrpStackLocation(irp);
+    next->MajorFunction = IRP_MJ_SCSI;
+    next->Parameters.Scsi.Srb = srb;
+    IoSetCompletionRoutine(irp, IdePdoIoctlDone, &event, TRUE, TRUE, TRUE);
+    if (IoCallDriver(Device, irp) == STATUS_PENDING) {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+    }
+    status = irp->IoStatus.Status;
+    irp->MdlAddress = NULL;
+    IoFreeMdl(mdl);
+    IoFreeIrp(irp);
+    ExFreePool(srb);
+    Irp->IoStatus.Information = length < outLen ? length : outLen;
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+
+done:
+    Irp->IoStatus.Information = 0;
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+/* ScsiPort creates the adapter's device object as FILE_DEVICE_CONTROLLER,
+   its PDOs with the type of the device (disk, CD-ROM, mass storage) */
+static NTSTATUS NTAPI
+IdeDeviceControlDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+
+    if (Device->DeviceType != FILE_DEVICE_CONTROLLER &&
+        stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_SCSI_MINIPORT &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        return IdePdoMiniportIoctl(Device, Irp);
+    }
+    return g_IdeOrigDeviceControl(Device, Irp);
+}
+
+/* After ScsiPortInitialize: ScsiPort's IRP_MJ_PNP and IRP_MJ_DEVICE_CONTROL
+   entries get a front end */
 VOID
 IdeHookPnp(IN PVOID DriverObject)
 {
     PDRIVER_OBJECT driver = (PDRIVER_OBJECT)DriverObject;
 
-    if (driver == NULL || driver->MajorFunction[IRP_MJ_PNP] == NULL ||
+    if (driver == NULL) return;
+    if (driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] != NULL &&
+        driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] != IdeDeviceControlDispatch) {
+        g_IdeOrigDeviceControl = driver->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+        driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IdeDeviceControlDispatch;
+    }
+    if (driver->MajorFunction[IRP_MJ_PNP] == NULL ||
         driver->MajorFunction[IRP_MJ_PNP] == IdePnpDispatch) {
         return;
     }

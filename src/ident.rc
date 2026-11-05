@@ -4,8 +4,8 @@
 
 #include <winver.h>
 
-#define IDE_VER_NUM              1,1,0,0
-#define IDE_VER_STR              "1.1.0.0"
+#define IDE_VER_NUM              1,2,0,0
+#define IDE_VER_STR              "1.2.0.0"
 
 #ifdef IDE_W9X
 #define IDE_FILE_STR             "ident9x.mpd"

@@ -8,7 +8,7 @@ Signature="$Windows NT$"
 Class=SCSIAdapter
 ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=10/19/2026,1.1.0.0
+DriverVer=11/02/2026,1.2.0.0
 PnpLockdown=1
 
 [DestinationDirs]
@@ -1084,8 +1084,9 @@ identpp.dll=1
 ; interface bits 0 and 2 clear) raises ISA IRQ 14 and 15, which the PCI bus
 ; driver does not report for it, and ScsiPort does not start a PCI adapter
 ; without an interrupt resource. The driver adds IRQ 14 to such a function's
-; start request itself (idepnp.c); the function starts as one adapter, the
-; primary channel interrupt-driven, the secondary with Fast Polling.
+; start request itself (idepnp.c); the function starts as one adapter with
+; the primary channel on IRQ 14, and the driver connects IRQ 15 for the
+; secondary channel once ScsiPort has started it.
 
 [Ide_Inst]
 CopyFiles = Ide_CopyFiles, Ide_PageFiles
@@ -1101,6 +1102,9 @@ ErrorControl   = %SERVICE_ERROR_NORMAL%
 ServiceBinary  = %12%\IDENT.sys
 LoadOrderGroup = SCSI Miniport
 AddReg         = Ide_AddReg
+
+[Ide_AddReg]
+HKR,"Parameters\PnpInterface","5",%REG_DWORD%,1
 
 [Ide_CopyFiles]
 IDENT.sys

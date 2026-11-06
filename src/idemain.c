@@ -2118,6 +2118,14 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     HW_INITIALIZATION_DATA initData;
     ULONG status, status2;
 
+#ifdef IDE_W9X
+    /* The Windows 9x loader leaves .bss as it found it: whatever was in
+       that RAM. QEMU clears its RAM, so this only shows on real hardware,
+       where a garbage count makes IdeIsPortClaimed read past the table. */
+    g_IdeClaimedCount = 0;
+    g_IdeCapacity16 = FALSE;
+#endif
+
     g_IdeDumpMode = (BOOLEAN)(DriverObject == NULL);
 
     IDE_DBG((IDE_PFX "DriverEntry%s\n", g_IdeDumpMode ? " (dump)" : ""));

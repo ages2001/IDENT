@@ -29,6 +29,27 @@ static BOOLEAN g_IdeDumpMode;
    reports FFFFFFFFh: Server 2003 SP1 and later, XP x64 */
 static BOOLEAN g_IdeCapacity16;
 
+#if defined(IDE_BOOT_TRACE) && defined(IDE_NT31_COMPAT)
+#include <stdarg.h>
+int __cdecl _vsnprintf(char *buffer, unsigned int size, const char *format, va_list args);
+VOID __stdcall HalDisplayString(PUCHAR String);
+static BOOLEAN g_IdeTraceBootScreen;
+
+VOID __cdecl
+IdeTraceBoot(PCHAR Format, ...)
+{
+    CHAR line[256];
+    va_list args;
+
+    va_start(args, Format);
+    _vsnprintf(line, sizeof(line) - 1, Format, args);
+    va_end(args);
+    line[sizeof(line) - 1] = 0;
+    DbgPrint("%s", line);
+    if (g_IdeTraceBootScreen) HalDisplayString((PUCHAR)line);
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Windows 9x: VMM services                                            */
 /* ------------------------------------------------------------------ */
@@ -142,6 +163,7 @@ IdeClaimPort(IN USHORT CmdPort)
 /* ------------------------------------------------------------------ */
 
 #define IDE_PCI_HEADER_LENGTH           64
+#define IDE_PCI_EXTRA_LENGTH            0xA0        /* with 40h-9Fh: the channel enables */
 #define IDE_PCI_MULTIFUNCTION           0x80
 
 #if defined(IDE_NT31_COMPAT) || defined(IDE_W9X)
@@ -173,6 +195,18 @@ IdePciReadPortDword(IN ULONG Bus, IN ULONG Slot, IN ULONG Offset)
     return ScsiPortReadPortUlong((PULONG)IDE_PCI_CONFIG_DATA);
 }
 
+/* 40h-9Fh of a function (the channel enables) */
+static VOID
+IdePciReadPortExtra(IN ULONG Bus, IN ULONG Slot, OUT PPCI_COMMON_CONFIG PciConfig)
+{
+    PULONG dw = (PULONG)PciConfig;
+    ULONG i;
+
+    for (i = IDE_PCI_HEADER_LENGTH / sizeof(ULONG); i < IDE_PCI_EXTRA_LENGTH / sizeof(ULONG); i++) {
+        dw[i] = IdePciReadPortDword(Bus, Slot, i * sizeof(ULONG));
+    }
+}
+
 static BOOLEAN
 IdePciReadPortHeader(IN ULONG Bus, IN ULONG Slot, OUT PPCI_COMMON_CONFIG PciConfig)
 {
@@ -184,6 +218,7 @@ IdePciReadPortHeader(IN ULONG Bus, IN ULONG Slot, OUT PPCI_COMMON_CONFIG PciConf
     for (i = 1; i < IDE_PCI_HEADER_LENGTH / sizeof(ULONG); i++) {
         dw[i] = IdePciReadPortDword(Bus, Slot, i * sizeof(ULONG));
     }
+    if (PciConfig->BaseClass == PCI_CLASS_MASS_STORAGE) IdePciReadPortExtra(Bus, Slot, PciConfig);
     return TRUE;
 }
 
@@ -300,6 +335,16 @@ IdeReadPciHeader(
     if (BusMissing != NULL) *BusMissing = (BOOLEAN)(bytesRead == 0);
     if (bytesRead < IDE_PCI_HEADER_LENGTH) return FALSE;
     if (PciConfig->VendorID == 0xFFFF || PciConfig->VendorID == 0x0000) return FALSE;
+    /* A mass storage function: also 40h-9Fh, where the chip set keeps its
+       channel enables (IdePciChannelEnabled) */
+    if (PciConfig->BaseClass == PCI_CLASS_MASS_STORAGE &&
+        ScsiPortGetBusData(HwInit, PCIConfiguration, Bus, Slot, PciConfig, IDE_PCI_EXTRA_LENGTH) < IDE_PCI_EXTRA_LENGTH) {
+#ifdef IDE_PCI_PORTS
+        IdePciReadPortExtra(Bus, Slot, PciConfig);
+#else
+        ZeroMemoryBytes(PciConfig->DeviceSpecific, IDE_PCI_EXTRA_LENGTH - IDE_PCI_HEADER_LENGTH);
+#endif
+    }
     return TRUE;
 }
 
@@ -316,7 +361,17 @@ IdePciConfigIsIde(IN PPCI_COMMON_CONFIG PciConfig)
 {
     if (PciConfig->BaseClass != PCI_CLASS_MASS_STORAGE) return FALSE;
     if ((PciConfig->HeaderType & 0x7F) != 0) return FALSE;
-    if (PciConfig->SubClass == PCI_SUBCLASS_IDE) return TRUE;
+    if (PciConfig->SubClass == PCI_SUBCLASS_IDE) {
+        /* JMicron JMB362B/C: an AHCI function with the IDE class code (its
+           ABAR in BAR5), driven by AHCINT, as Linux's ahci takes it */
+        if (PciConfig->VendorID == 0x197B &&
+            (PciConfig->DeviceID == 0x2362 || PciConfig->DeviceID == 0x236F) &&
+            (PciConfig->u.type0.BaseAddresses[5] & ~0xFUL) != 0 &&
+            (PciConfig->u.type0.BaseAddresses[5] & 1) == 0) {
+            return FALSE;
+        }
+        return TRUE;
+    }
 
     /* Silicon Image 3112/3512/3114 and the ATI IXP SATA functions built on
        them (SATA, class 0180 or 0104) */
@@ -820,6 +875,94 @@ static const struct { USHORT Cmd; USHORT Ctl; UCHAR Irq; } g_IdeLegacy[IDE_LEGAC
 };
 
 /* The two channels of a PCI IDE function, from its class code and BARs */
+/* Intel SATA functions in IDE mode with a PATA function next to them: in
+   combined mode (MAP, 90h) the PATA function has one of the two legacy
+   channels. The values are those of Linux ata_piix (ich5_map_db, mask 7;
+   ich6_map_db/ich6m_map_db, mask 3). */
+static BOOLEAN
+IdeIntelSataIde(IN USHORT DeviceId)
+{
+    switch (DeviceId) {
+    case 0x24D1: case 0x25A3:                           /* ICH5, 6300ESB */
+    case 0x2651: case 0x2652: case 0x2653:              /* ICH6, ICH6R, ICH6M */
+    case 0x2680:                                        /* 631xESB/632xESB */
+    case 0x27C0: case 0x27C4:                           /* ICH7, ICH7M */
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+IdeIntelSataChannelIsPata(IN PPCI_COMMON_CONFIG PciConfig, IN ULONG Channel)
+{
+    UCHAR map = PciConfig->DeviceSpecific[0x90 - 0x40];
+
+    if (PciConfig->VendorID != 0x8086 || PciConfig->SubClass != PCI_SUBCLASS_IDE) return FALSE;
+    switch (PciConfig->DeviceID) {
+    case 0x24D1:                                        /* ICH5 */
+    case 0x25A3:                                        /* 6300ESB */
+        map &= 7;
+        if (map == 4 || map == 5) return (BOOLEAN)(Channel == 1);   /* SATA primary, PATA secondary */
+        if (map == 6 || map == 7) return (BOOLEAN)(Channel == 0);   /* PATA primary, SATA secondary */
+        return FALSE;
+    case 0x2651: case 0x2652: case 0x2653:              /* ICH6, ICH6R, ICH6M */
+    case 0x2680:                                        /* 631xESB/632xESB */
+    case 0x27C0: case 0x27C4:                           /* ICH7, ICH7M */
+        map &= 3;
+        if (map == 1) return (BOOLEAN)(Channel == 0);               /* PATA primary */
+        if (map == 2) return (BOOLEAN)(Channel == 1);               /* PATA secondary */
+        return FALSE;
+    default:
+        return FALSE;
+    }
+}
+
+/* A channel the chip set has turned off (the BIOS setup's "Disabled", or a
+   legacy channel an Intel ICH gives to its other function in combined mode):
+   it decodes nothing or another function answers on its ports, so it is not
+   used and its ports are not claimed. The enable bits are those Linux checks
+   before it resets a channel (ata_piix, pata_via, pata_amd); a chip that is
+   not listed counts as enabled. */
+static BOOLEAN
+IdePciChannelEnabled(IN PPCI_COMMON_CONFIG PciConfig, IN ULONG Channel)
+{
+    const UCHAR *cfg = PciConfig->DeviceSpecific;       /* offset 40h */
+    UCHAR bit = (UCHAR)(Channel ? 0x01 : 0x02);
+
+    if (PciConfig->VendorID == 0x8086) {
+        /* IDETIM (40h primary, 42h secondary) bit 15: IDE decode enable, on
+           the PIIX/ICH PATA functions and the ICH SATA functions alike */
+        if (IdeIntelKind(PciConfig->VendorID, PciConfig->DeviceID) != IDE_INTEL_NONE ||
+            IdeIntelSataIde(PciConfig->DeviceID)) {
+            if (!(cfg[(Channel ? 0x43 : 0x41) - 0x40] & 0x80)) return FALSE;
+        }
+        return (BOOLEAN)!IdeIntelSataChannelIsPata(PciConfig, Channel);
+    }
+    if (PciConfig->VendorID == 0x1106) {
+        /* VIA south bridges (40h bit 1 primary, bit 0 secondary); the VT6410 and
+           VT6415 cards have no enables */
+        switch (PciConfig->DeviceID) {
+        case 0x0571: case 0x1571: case 0x5324: case 0xC409:
+            return (BOOLEAN)((cfg[0] & bit) != 0);
+        default:
+            return TRUE;
+        }
+    }
+    if (PciConfig->VendorID == 0x1022) {
+        switch (PciConfig->DeviceID) {
+        case 0x7401: case 0x7409: case 0x7411: case 0x7441: case 0x7469:
+            return (BOOLEAN)((cfg[0] & bit) != 0);       /* AMD: 40h */
+        default:
+            return TRUE;
+        }
+    }
+    if (PciConfig->VendorID == 0x10DE && IdeChipKind(PciConfig->VendorID, PciConfig->DeviceID) == IDE_CHIP_AMD) {
+        return (BOOLEAN)((cfg[0x50 - 0x40] & bit) != 0); /* nVidia nForce: 50h */
+    }
+    return TRUE;
+}
+
 static ULONG
 IdeDescribePciChannels(IN PPCI_COMMON_CONFIG PciConfig, OUT PIDE_CHANNEL_DESC Desc)
 {
@@ -831,6 +974,17 @@ IdeDescribePciChannels(IN PPCI_COMMON_CONFIG PciConfig, OUT PIDE_CHANNEL_DESC De
                           ((PciConfig->ProgIf & IDE_PROGIF_BUS_MASTER) || sataClass)) ? (bar4 & 0xFFFC) : 0);
     ULONG n = 0, c;
 
+#if defined(IDE_BOOT_TRACE) && defined(IDE_NT31_COMPAT)
+    if (PciConfig->VendorID == 0x8086 &&
+        (PciConfig->DeviceID == 0x24DB || PciConfig->DeviceID == 0x24D1)) {
+        const UCHAR *cfg = PciConfig->DeviceSpecific;
+        IDE_DBG((IDE_PFX "ICH5 %04lX progif=%02lX PCIcmd=%04lX IDETIM=%02lX/%02lX "
+                 "IOCFG=%02lX MAP=%02lX BM=%04lX\n",
+                 (ULONG)PciConfig->DeviceID, (ULONG)PciConfig->ProgIf, (ULONG)PciConfig->Command,
+                 (ULONG)cfg[1], (ULONG)cfg[3], (ULONG)cfg[0x14], (ULONG)cfg[0x50], (ULONG)bm));
+    }
+#endif
+
     for (c = 0; c < 2; c++) {
         UCHAR nativeBit = (UCHAR)(c ? IDE_PROGIF_SECONDARY_NATIVE : IDE_PROGIF_PRIMARY_NATIVE);
         ULONG barCmd = PciConfig->u.type0.BaseAddresses[c ? IDE_BAR_SECONDARY_CMD : IDE_BAR_PRIMARY_CMD];
@@ -839,6 +993,7 @@ IdeDescribePciChannels(IN PPCI_COMMON_CONFIG PciConfig, OUT PIDE_CHANNEL_DESC De
 
         ZeroMemoryBytes(d, sizeof(*d));
         d->Index = (UCHAR)c;
+        if (!IdePciChannelEnabled(PciConfig, c)) continue;
         if ((PciConfig->ProgIf & nativeBit) || sataClass) {
             if (!(barCmd & 1) || !(barCtl & 1) || (barCmd & 0xFFF8) == 0 || (barCtl & 0xFFFC) == 0) continue;
             d->CmdPort = (USHORT)(barCmd & 0xFFF8);
@@ -856,6 +1011,25 @@ IdeDescribePciChannels(IN PPCI_COMMON_CONFIG PciConfig, OUT PIDE_CHANNEL_DESC De
     }
     return n;
 }
+
+#if !defined(IDE_NT4)
+/* PnP start of a compatibility-mode function (idepnp.c): the ISA IRQ of
+   its first channel in use, 0 when it has none. In an Intel ICH's
+   combined mode the PATA and the SATA function have one legacy channel
+   each, so one of them raises IRQ 15 only. */
+ULONG
+IdePciCompatIrq(IN PVOID PciConfig)
+{
+    IDE_CHANNEL_DESC desc[2];
+    ULONG n, i;
+
+    n = IdeDescribePciChannels((PPCI_COMMON_CONFIG)PciConfig, desc);
+    for (i = 0; i < n; i++) {
+        if (!desc[i].Native) return desc[i].Irq;
+    }
+    return 0;
+}
+#endif
 
 /* Walk the PCI buses for the next IDE function with an unclaimed channel
    (with NativeOnly: an unclaimed channel in native mode) */
@@ -912,14 +1086,14 @@ static BOOLEAN
 IdeFindCompatFunction(
     IN PHW_DEVICE_EXTENSION HwInit,
     IN USHORT CmdPort,
+    IN BOOLEAN AlsoDisabled,
     OUT PULONG FoundBus,
     OUT PULONG FoundSlot,
     OUT PPCI_COMMON_CONFIG PciConfig
 )
 {
     PCI_SLOT_NUMBER slot;
-    IDE_CHANNEL_DESC desc[2];
-    ULONG bus, device, function, n, i;
+    ULONG bus, device, function, i;
     BOOLEAN busMissing, multiFunction;
 
     for (bus = 0; bus < 256; bus++) {
@@ -937,12 +1111,20 @@ IdeFindCompatFunction(
                 }
                 if (function == 0) multiFunction = (BOOLEAN)((PciConfig->HeaderType & IDE_PCI_MULTIFUNCTION) != 0);
                 if (!IdePciConfigIsIde(PciConfig)) continue;
-                n = IdeDescribePciChannels(PciConfig, desc);
-                for (i = 0; i < n; i++) {
-                    if (!desc[i].Native && desc[i].CmdPort == CmdPort) {
-                        *FoundBus = bus;
-                        *FoundSlot = slot.u.AsULONG;
-                        return TRUE;
+                /* Also a channel the chip set has turned off: the legacy ports of
+                   a compatibility-mode channel are the chip set's, not an ISA
+                   card's, whether it decodes them (or its other function does,
+                   an ICH in combined mode) or nobody does (AlsoDisabled: the
+                   ISA pass; the dump instance wants the function in charge) */
+                if (PciConfig->SubClass == PCI_SUBCLASS_IDE) {
+                    for (i = 0; i < 2; i++) {
+                        if (!(PciConfig->ProgIf & (i ? IDE_PROGIF_SECONDARY_NATIVE : IDE_PROGIF_PRIMARY_NATIVE)) &&
+                            g_IdeLegacy[i].Cmd == CmdPort &&
+                            (AlsoDisabled || IdePciChannelEnabled(PciConfig, i))) {
+                            *FoundBus = bus;
+                            *FoundSlot = slot.u.AsULONG;
+                            return TRUE;
+                        }
                     }
                 }
             }
@@ -1022,11 +1204,13 @@ typedef struct _IDE_IO_FUNCTION {
 } IDE_IO_FUNCTION;
 
 typedef struct _IDE_IO_MAP {
-    IDE_IO_RANGE    Used[IDE_IO_USED_MAX];
+    IDE_IO_RANGE    Used[IDE_IO_USED_MAX];      /* taken, for the search of a free block */
     ULONG           UsedCount;
+    IDE_IO_RANGE    Ide[IDE_IO_USED_MAX];       /* IDE ports decoded for certain */
+    ULONG           IdeRangeCount;
     IDE_IO_BRIDGE   Bridge[IDE_IO_BRIDGES_MAX];
     ULONG           BridgeCount;
-    IDE_IO_FUNCTION Ide[IDE_IO_FUNCTIONS_MAX];
+    IDE_IO_FUNCTION Fn[IDE_IO_FUNCTIONS_MAX];
     ULONG           IdeCount;
     BOOLEAN         Overflow;                   /* a table ran full: move nothing */
 } IDE_IO_MAP;
@@ -1046,6 +1230,34 @@ IdeIoAddUsed(IN ULONG Start, IN ULONG End)
     m->Used[m->UsedCount].Start = Start;
     m->Used[m->UsedCount].End = End;
     m->UsedCount++;
+}
+
+/* Ports an IDE channel decodes for certain: the legacy ports of a
+   compatibility-mode channel, the exact command and control blocks of a
+   native one */
+static VOID
+IdeIoAddIde(IN ULONG Start, IN ULONG End)
+{
+    IDE_IO_MAP *m = &g_IdeIoMap;
+    IdeIoAddUsed(Start, End);
+    if (Start == 0 || End < Start) return;
+    if (m->IdeRangeCount >= IDE_IO_USED_MAX) {
+        m->Overflow = TRUE;
+        return;
+    }
+    m->Ide[m->IdeRangeCount].Start = Start;
+    m->Ide[m->IdeRangeCount].End = End;
+    m->IdeRangeCount++;
+}
+
+static BOOLEAN
+IdeIoOverlapsIde(IN ULONG Start, IN ULONG End)
+{
+    ULONG i;
+    for (i = 0; i < g_IdeIoMap.IdeRangeCount; i++) {
+        if (Start <= g_IdeIoMap.Ide[i].End && End >= g_IdeIoMap.Ide[i].Start) return TRUE;
+    }
+    return FALSE;
 }
 
 static BOOLEAN
@@ -1140,7 +1352,7 @@ IdeIoScan(IN PHW_DEVICE_EXTENSION HwInit)
 
                 if (IdePciConfigIsIde(&cfg) && m->IdeCount >= IDE_IO_FUNCTIONS_MAX) m->Overflow = TRUE;
                 if (IdePciConfigIsIde(&cfg) && m->IdeCount < IDE_IO_FUNCTIONS_MAX) {
-                    IDE_IO_FUNCTION *f = &m->Ide[m->IdeCount++];
+                    IDE_IO_FUNCTION *f = &m->Fn[m->IdeCount++];
                     f->Bus = bus;
                     f->Slot = slot.u.AsULONG;
                     f->ProgIf = cfg.ProgIf;
@@ -1149,8 +1361,8 @@ IdeIoScan(IN PHW_DEVICE_EXTENSION HwInit)
                     /* Compatibility-mode channels decode the legacy ports */
                     for (c = 0; c < 2; c++) {
                         if (IdeIoChannelNative(f, c)) continue;
-                        IdeIoAddUsed(g_IdeLegacy[c].Cmd, g_IdeLegacy[c].Cmd + 7);
-                        IdeIoAddUsed(g_IdeLegacy[c].Ctl, g_IdeLegacy[c].Ctl);
+                        IdeIoAddIde(g_IdeLegacy[c].Cmd, g_IdeLegacy[c].Cmd + 7);
+                        IdeIoAddIde(g_IdeLegacy[c].Ctl, g_IdeLegacy[c].Ctl);
                     }
                     IdeIoAddBar(cfg.u.type0.BaseAddresses[4]);
                     IdeIoAddBar(cfg.u.type0.BaseAddresses[5]);
@@ -1256,12 +1468,17 @@ IdeResolvePortConflicts(IN PHW_DEVICE_EXTENSION HwInit)
     IdeIoScan(HwInit);
 
     for (f = 0; f < m->IdeCount; f++) {
-        IDE_IO_FUNCTION *fn = &m->Ide[f];
+        IDE_IO_FUNCTION *fn = &m->Fn[f];
 
+        /* Only another IDE channel on the same ports is a conflict: the
+           size of any other BAR is only bounded by its alignment here, and
+           a board's BIOS does not overlap BARs (GitHub issue #4: on real
+           boards a display controller's I/O BAR at F000h made every SATA
+           IDE BAR above it look taken, and the functions were moved) */
         conflict = FALSE;
         for (c = 0; c < 2; c++) {
             if (!IdeIoChannelNative(fn, c) || !IdeIoChannelRanges(fn, c, &cmd, &ctl)) continue;
-            if (IdeIoOverlapsUsed(cmd.Start, cmd.End) || IdeIoOverlapsUsed(ctl.Start, ctl.End)) conflict = TRUE;
+            if (IdeIoOverlapsIde(cmd.Start, cmd.End) || IdeIoOverlapsIde(ctl.Start, ctl.End)) conflict = TRUE;
         }
         if (conflict) {
             block = IdeIoFindBlock(fn);
@@ -1281,8 +1498,8 @@ IdeResolvePortConflicts(IN PHW_DEVICE_EXTENSION HwInit)
         }
         for (c = 0; c < 2; c++) {
             if (!IdeIoChannelNative(fn, c) || !IdeIoChannelRanges(fn, c, &cmd, &ctl)) continue;
-            IdeIoAddUsed(cmd.Start, cmd.End);
-            IdeIoAddUsed(ctl.Start, ctl.End);
+            IdeIoAddIde(cmd.Start, cmd.End);
+            IdeIoAddIde(ctl.Start, ctl.End);
         }
     }
 }
@@ -1755,10 +1972,23 @@ IdeHotPlugCheck(IN PHW_DEVICE_EXTENSION HwInit)
 
 /* Interrupt watchdog: the timer completes what the interrupt missed.
    Hot plug: the channels are checked. */
+static VOID IdeEnter(IN PHW_DEVICE_EXTENSION HwInit);
+static VOID IdeLeave(IN PHW_DEVICE_EXTENSION HwInit);
+static VOID IdeTimerBody(IN PHW_DEVICE_EXTENSION hwInit);
+
 VOID
 IdeTimer(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
+
+    IdeEnter(hwInit);
+    IdeTimerBody(hwInit);
+    IdeLeave(hwInit);
+}
+
+static VOID
+IdeTimerBody(IN PHW_DEVICE_EXTENSION hwInit)
+{
     ULONG c, missed = 0, elapsed = hwInit->TimerUsec;
     BOOLEAN pending = FALSE;
 
@@ -1920,6 +2150,7 @@ IdeEnsurePnpInterface(IN PVOID RegistryPath)
 #define IDE_KEY_VALUE_PARTIAL_INFORMATION   2
 
 static USHORT g_IdeStartName[] = L"Start";
+static USHORT g_IdeNotInboxName[] = L"NotInboxDriver";
 static USHORT g_IdeAtdiskName[] = L"atdisk";
 static USHORT g_IdeAtapiName[] = L"atapi";
 static USHORT g_IdeAtdiskSaved[] = L"InboxStart_atdisk";
@@ -2082,6 +2313,13 @@ IdeDisableInboxDrivers(IN PVOID RegistryPath)
         if (IdeSameName(&path->Buffer[n], path->Length / sizeof(USHORT) - n, inbox[i])) continue;
         key = IdeRegOpen(services, inbox[i], inboxBytes[i]);
         if (key == NULL) continue;
+        /* AHCINT, MMCSDNT or NVMENT copied over atapi.sys (they mark their
+           service key): not an in-box IDE driver, possibly the system disk */
+        if (IdeRegReadDword(key, g_IdeNotInboxName, sizeof(g_IdeNotInboxName), &old) && old != 0) {
+            IDE_DBG((IDE_PFX "DriverEntry: %s is not the in-box driver, left alone\n", inboxText[i]));
+            ZwClose(key);
+            continue;
+        }
         if (!IdeRegReadDword(ident, saved[i], savedBytes[i], &old) &&
             IdeRegReadDword(key, g_IdeStartName, sizeof(g_IdeStartName), &start)) {
             IdeRegWriteDword(ident, saved[i], savedBytes[i], start);
@@ -2112,14 +2350,33 @@ IdeDisableInboxDrivers(IN PVOID RegistryPath)
 }
 #endif
 
+#ifdef IDE_W9X
+/* The Windows 9x loader does not clear the uninitialized data of a .MPD
+   (its RAM holds whatever was there): every global that has to start at
+   zero is cleared before anything reads it */
+static VOID
+IdeClearGlobals9x(VOID)
+{
+    ZeroMemoryBytes(&g_IdeCapacity16, sizeof(g_IdeCapacity16));
+    ZeroMemoryBytes(&g_IdeClaimedPorts, sizeof(g_IdeClaimedPorts));
+    ZeroMemoryBytes(&g_IdeClaimedCount, sizeof(g_IdeClaimedCount));
+}
+#endif
+
 ULONG
 DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
     HW_INITIALIZATION_DATA initData;
     ULONG status, status2;
 
+#ifdef IDE_W9X
+    IdeClearGlobals9x();
+#endif
     g_IdeDumpMode = (BOOLEAN)(DriverObject == NULL);
 
+#if defined(IDE_BOOT_TRACE) && defined(IDE_NT31_COMPAT)
+    g_IdeTraceBootScreen = (BOOLEAN)!g_IdeDumpMode;
+#endif
     IDE_DBG((IDE_PFX "DriverEntry%s\n", g_IdeDumpMode ? " (dump)" : ""));
 
 #if !defined(IDE_NT4)
@@ -2170,13 +2427,13 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     initData.MapBuffers = TRUE;
     initData.NeedPhysicalAddresses = TRUE;
     initData.AutoRequestSense = FALSE;
-#if defined(IDE_NT4)
+#if defined(IDE_W9X)
     initData.TaggedQueuing = FALSE;
     initData.MultipleRequestPerLu = FALSE;
 #else
-    /* 2000/XP/x64: queued requests per disk in interrupt mode; INQUIRY
-       reports CmdQue only for disks that get them (IdeDiskQueued). Not in
-       the dump stack. */
+    /* NT 3.1-4.0, 2000/XP/x64: queued requests per disk in interrupt mode;
+       INQUIRY reports CmdQue only for disks that get them (IdeDiskQueued).
+       Not in the dump stack. */
     initData.TaggedQueuing = (BOOLEAN)!g_IdeDumpMode;
     initData.MultipleRequestPerLu = (BOOLEAN)!g_IdeDumpMode;
 #endif
@@ -2199,7 +2456,7 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
         status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
         IDE_DBG((IDE_PFX "DriverEntry: ScsiPortInitialize returned %08lX\n", status));
         if (g_IdeAdapterFound) IdeDisableInboxDrivers(Argument2);
-        return status;
+        goto done;
     }
 #endif
 
@@ -2227,6 +2484,12 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     if (!g_IdeDumpMode && status == 0) IdeHookPnp(DriverObject);
     IDE_DBG((IDE_PFX "DriverEntry: ScsiPortInitialize returned %08lX\n", status));
 #endif
+#ifdef IDE_NT31_COMPAT
+done:
+#ifdef IDE_BOOT_TRACE
+    g_IdeTraceBootScreen = FALSE;
+#endif
+#endif
     return status;
 }
 
@@ -2253,6 +2516,20 @@ IdeArgPresent(IN PCHAR Args, IN PCHAR Key)
     return FALSE;
 }
 
+#ifdef IDE_NT31_COMPAT
+/* A compatibility-mode channel of a PCI function on NT 3.1-4.0. ScsiPort
+   may still reject its adapter after FindAdapter (GitHub issue #4: an MPS
+   HAL that could not map the ICH5's bus-master block on the EISA bus), so
+   its legacy port is claimed only when HwInitialize runs and the ISA pass
+   can take it otherwise; and its bus-master block is mapped first. First
+   seen on the ICH5 PATA function; the HAL behaviour is not the chip's. */
+static BOOLEAN
+IdeLegacyPciChannel(IN PHW_DEVICE_EXTENSION HwInit, IN BOOLEAN Native)
+{
+    return (BOOLEAN)(!HwInit->DumpMode && HwInit->VendorId != 0 && !Native);
+}
+#endif
+
 /* Map one channel's ports and record it in the extension */
 static BOOLEAN
 IdeAttachChannel(
@@ -2261,7 +2538,8 @@ IdeAttachChannel(
     IN INTERFACE_TYPE BusType,
     IN ULONG BusNumber,
     IN ULONG Index,
-    IN PIDE_CHANNEL_DESC Desc
+    IN PIDE_CHANNEL_DESC Desc,
+    IN PUCHAR MappedBm
 )
 {
     PIDE_CHANNEL ch = &HwInit->Channels[Index];
@@ -2283,7 +2561,8 @@ IdeAttachChannel(
                  (ULONG)Desc->CmdPort, (ULONG)Desc->CtlPort));
         return FALSE;
     }
-    if (Desc->BmPort != 0) {
+    ch->Bm = MappedBm;
+    if (ch->Bm == NULL && Desc->BmPort != 0) {
         pa.LowPart = Desc->BmPort;
         ch->Bm = (PUCHAR)ScsiPortGetDeviceBase(HwInit, BusType, BusNumber, pa, 8, TRUE);
         if (ch->Bm == NULL) {
@@ -2291,7 +2570,12 @@ IdeAttachChannel(
         }
     }
     ch->Present = TRUE;
-    IdeClaimPort(Desc->CmdPort);
+#ifdef IDE_NT31_COMPAT
+    /* ScsiPort can reject this adapter after FindAdapter. Keep the legacy
+       port available to the ISA pass until HwInitialize actually runs. */
+    if (!IdeLegacyPciChannel(HwInit, Desc->Native))
+#endif
+        IdeClaimPort(Desc->CmdPort);
     (VOID)ConfigInfo;
     return TRUE;
 }
@@ -2426,6 +2710,7 @@ IdeFindAdapter(
     BOOLEAN interrupts, level2;
     INTERFACE_TYPE busType;
     ULONG busNumber;
+    PUCHAR mappedBm = NULL;
 
     (VOID)Context;
     (VOID)BusInformation;
@@ -2464,7 +2749,7 @@ IdeFindAdapter(
 #endif
     hwInit->DmaAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "DMA=0");
     hwInit->TrimAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "TRIM=0");
-#if defined(IDE_NT4)
+#if defined(IDE_W9X)
     hwInit->QueueAllowed = FALSE;
 #else
     hwInit->QueueAllowed = (BOOLEAN)!IdeArgPresent(ArgumentString, "QUEUE=0");
@@ -2575,7 +2860,7 @@ selectChannel:
             if (IdeIsPortClaimed(g_IdeLegacy[i].Cmd)) continue;
 #if !defined(IDE_NT4)
             /* A PCI function's channel: PnP starts the function (idepnp.c) */
-            if (IdeFindCompatFunction(hwInit, g_IdeLegacy[i].Cmd, &targetBus, &targetSlot, &pciConfig)) continue;
+            if (IdeFindCompatFunction(hwInit, g_IdeLegacy[i].Cmd, TRUE, &targetBus, &targetSlot, &pciConfig)) continue;
 #endif
             if (!IdeLegacyChannelPresent(g_IdeLegacy[i].Cmd, g_IdeLegacy[i].Ctl)) {
                 IdeClaimPort(g_IdeLegacy[i].Cmd);   /* not probed again */
@@ -2620,7 +2905,7 @@ selectChannel:
                 desc[0].CmdPort = g_IdeLegacy[i].Cmd;
                 desc[0].CtlPort = g_IdeLegacy[i].Ctl;
                 desc[0].Irq = g_IdeLegacy[i].Irq;
-                if (IdeFindCompatFunction(hwInit, desc[0].CmdPort, &targetBus, &targetSlot, &pciConfig)) {
+                if (IdeFindCompatFunction(hwInit, desc[0].CmdPort, FALSE, &targetBus, &targetSlot, &pciConfig)) {
                     IDE_CHANNEL_DESC all[2];
                     ULONG n = IdeDescribePciChannels(&pciConfig, all);
                     for (i = 0; i < n; i++) {
@@ -2690,6 +2975,23 @@ selectChannel:
         } else {
             /* Legacy IRQ 14/15 (edge). The EISA bus handler gives a 32-bit DMA
                adapter for the bus master; a plain ISA channel needs none. */
+#ifdef IDE_NT31_COMPAT
+            /* Verify the optional bus-master range before declaring an EISA
+               DMA adapter or reporting that range to ScsiPort. Some MPS HAL
+               configurations map the legacy ports but reject the PCI BAR on
+               the EISA bus. Register just the legacy resources in that case. */
+            if (pci && count == 1 && IdeLegacyPciChannel(hwInit, desc[first].Native) && desc[first].BmPort != 0) {
+                SCSI_PHYSICAL_ADDRESS pa;
+                pa.HighPart = 0;
+                pa.LowPart = desc[first].BmPort;
+                mappedBm = (PUCHAR)ScsiPortGetDeviceBase(hwInit, Eisa, 0, pa, 8, TRUE);
+                if (mappedBm == NULL) {
+                    IDE_DBG((IDE_PFX "FindAdapter: bus master %04lX unavailable on EISA, "
+                             "using ISA PIO at %04lX\n", (ULONG)desc[first].BmPort, (ULONG)desc[first].CmdPort));
+                    desc[first].BmPort = 0;
+                }
+            }
+#endif
             busType = (desc[first].BmPort != 0) ? Eisa : Isa;
             busNumber = 0;
             ConfigInfo->AdapterInterfaceType = busType;
@@ -2743,7 +3045,7 @@ selectChannel:
     }
 
     for (c = 0; c < count; c++) {
-        if (!IdeAttachChannel(hwInit, ConfigInfo, busType, busNumber, c, &desc[first + c])) {
+        if (!IdeAttachChannel(hwInit, ConfigInfo, busType, busNumber, c, &desc[first + c], mappedBm)) {
             return SP_RETURN_ERROR;
         }
         hwInit->Channels[c].Off = IdeOffLookup(ArgumentString, pci, targetBus, targetSlot, desc[first + c].Index,
@@ -2868,7 +3170,15 @@ selectChannel:
 BOOLEAN
 IdeHwInitialize(IN PVOID DeviceExtension)
 {
-    IdeInitializeAll((PHW_DEVICE_EXTENSION)DeviceExtension);
+    PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
+#ifdef IDE_NT31_COMPAT
+    ULONG c;
+    for (c = 0; c < hwInit->ChannelCount; c++) {
+        if (IdeLegacyPciChannel(hwInit, hwInit->Channels[c].Native))
+            IdeClaimPort(hwInit->Channels[c].CmdPort);
+    }
+#endif
+    IdeInitializeAll(hwInit);
     IDE_DBG((IDE_PFX "HwInitialize: done\n"));
     return TRUE;
 }
@@ -2941,10 +3251,23 @@ IdeRequestNext(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_CHANNEL Ch, IN PSCSI_REQU
     ScsiPortNotification(NextRequest, HwInit, NULL);
 }
 
+static BOOLEAN IdeStartIoBody(IN PHW_DEVICE_EXTENSION hwInit, IN PSCSI_REQUEST_BLOCK Srb);
+
 BOOLEAN
 IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
     PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
+    BOOLEAN result;
+
+    IdeEnter(hwInit);
+    result = IdeStartIoBody(hwInit, Srb);
+    IdeLeave(hwInit);
+    return result;
+}
+
+static BOOLEAN
+IdeStartIoBody(IN PHW_DEVICE_EXTENSION hwInit, IN PSCSI_REQUEST_BLOCK Srb)
+{
     PIDE_CHANNEL ch = NULL;
     ULONG c, unit;
 
@@ -3023,10 +3346,10 @@ IdeStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 /* HwInterrupt                                                         */
 /* ------------------------------------------------------------------ */
 
-BOOLEAN
-IdeInterrupt(IN PVOID DeviceExtension)
+/* Every channel: commands in flight, stray interrupts */
+static BOOLEAN
+IdeServiceAll(IN PHW_DEVICE_EXTENSION hwInit)
 {
-    PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
     BOOLEAN claimed = FALSE;
     ULONG c;
     UCHAR bmsts;
@@ -3071,6 +3394,47 @@ IdeInterrupt(IN PVOID DeviceExtension)
     return claimed;
 }
 
+/* Re-entry. On an APIC HAL the IRQ 15 the driver connects itself (2000/XP
+   x64, a compatibility-mode controller) can have a higher level than
+   ScsiPort's interrupt, and on a uniprocessor kernel ScsiPort's lock then
+   does not keep it out of a routine of the driver that is running: it
+   would complete, on the same processor, a command that routine is in
+   the middle of. Such an interrupt only notes that the channels must be
+   looked at, and the routine it came into does that before it returns. */
+static VOID
+IdeEnter(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    HwInit->InMiniport++;
+}
+
+static VOID
+IdeLeave(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    while (HwInit->Recheck) {
+        HwInit->Recheck = FALSE;
+        IdeServiceAll(HwInit);
+    }
+    HwInit->InMiniport--;
+}
+
+BOOLEAN
+IdeInterrupt(IN PVOID DeviceExtension)
+{
+    PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
+    BOOLEAN claimed;
+
+    if (hwInit->InMiniport != 0) {
+        hwInit->Recheck = TRUE;
+        hwInit->NestedInterrupts++;
+        return TRUE;
+    }
+    IdeEnter(hwInit);
+    claimed = IdeServiceAll(hwInit);
+    if (hwInit->Recheck) claimed = TRUE;
+    IdeLeave(hwInit);
+    return claimed;
+}
+
 /* ------------------------------------------------------------------ */
 /* HwResetBus                                                          */
 /* ------------------------------------------------------------------ */
@@ -3084,6 +3448,7 @@ IdeResetBus(IN PVOID HwDeviceExtension, IN ULONG PathId)
     (VOID)PathId;
     IDE_DBG((IDE_PFX "ResetBus\n"));
 
+    IdeEnter(hwInit);
     for (c = 0; c < hwInit->ChannelCount; c++) {
         PIDE_CHANNEL ch = &hwInit->Channels[c];
         if (!ch->Present) continue;
@@ -3100,6 +3465,7 @@ IdeResetBus(IN PVOID HwDeviceExtension, IN ULONG PathId)
         IdeResetChannel(hwInit, c);
         for (unit = 0; unit < IDE_DEVICES_PER_CHANNEL; unit++) ch->Devices[unit].SensePending = FALSE;
     }
+    IdeLeave(hwInit);
     return TRUE;
 }
 

@@ -1,5 +1,614 @@
-IDENT - test results (QEMU 8.2: PIIX3, CMD646, SiI3112); 1.1.0.0: see
+IDENT - test results (QEMU 8.2: PIIX3, CMD646, SiI3112); 1.1: see
 "Several controllers in one machine" below
+
+IDENT 1.3 (2026-11-09)
+==========================
+
+Regression with the four release drivers of this round (2026-11-23)
+
+- The QEMU changes these tests use (test hooks, the ICH5, Intel VMD and
+  RST remapping models) are in tests/qemu/qemu-8.2.2-tests.patch
+  (against the QEMU 8.2.2 source).
+- NT 4.0 SP1: AHCINT (system disk and a data disk on ich9-ahci), IDENT
+  (PIIX3 secondary), NVMENT, MMCSDNT (sdhci-pci) in one boot: four data
+  volumes, each TAG.TXT read.
+- NT 3.51 (MPS HAL, 2 CPUs, system disk on the ICH5 PATA model through
+  IDENT, no PIIX IDE): the same four data disks, each TAG.TXT read.
+- NT 3.1 with all four controllers: booted through IDENT to the logon
+  screen (QEMU's Ctrl+Alt+Del did not reach the NT 3.1 logon, so the
+  volumes were not listed).
+- Windows 95: odd95 (24 MB read at +1 and +3, written from +1) on AHCI,
+  NVMe and SD: every byte equal.
+- Windows 2000 SP4 and XP x64: see the Windows 7 section.
+
+
+Windows 7 and Vista, second round (2026-11-23)
+
+- Windows 7 SP1 x86 on a persistent overlay of the same image, the
+  release drivers of this round, data disks as before. Note: in the
+  first round the AHCI and SD disks had been read through msahci and
+  sdbus; pnputil installs no driver over Windows' own signed one, so
+  this round forces each driver with instdrv (SetupAPI, the INF of
+  bin\2KXP).
+- AHCINT as the boot controller: installed on the ich9-ahci (ICH8M
+  2829) with the system disk on the PIIX3, shut down, the system disk
+  moved to that controller's port 0: Windows 7 booted through AHCINT
+  (devst: AHCINT 0180400A), all volumes present; hibernated (S4) and
+  resumed (hibt: "resumed"), volumes read again; then a bug check
+  (crashme.sys): after the restart C:\Windows\MEMORY.DMP (124 MB) and
+  a minidump were there.
+- NVMENT as the boot controller: the system disk moved to the NVMe
+  controller: booted through NVMENT, hibernated and resumed, crash dump
+  written (MEMORY.DMP and a second minidump).
+- IDENT as the boot controller (PIIX3), IDENT also on the ICH5, MMCSDNT
+  on the SDHCI, with AHCINT and NVMENT: one boot with all four drivers,
+  TAG.TXT read on every data disk before and after hibernation; crash
+  dump written through IDENT.
+- Windows Vista SP2 x86 (Microsoft's IE7 test virtual machine, archive.org
+  zip MD5 085353d4ff3f8eb1b6026ff6d74a05d0 as published), QEMU 8.2 TCG:
+  AHCINT, MMCSDNT and IDENT (ICH5) installed with instdrv; IDENT on the
+  PIIX3 asked for a restart and Windows Vista then booted through IDENT;
+  hibernated and resumed, two crash dumps written through IDENT. Vista's
+  pnputil installs nothing on a device without a class (NVMe, VMD);
+  instdrv with the INF's class set on the device first did: NVMENT on
+  the NVMe controller and on the Intel VMD. One boot: TAG.TXT read on
+  the SD, AHCI, IDE, NVMe and VMD disks.
+- Windows 10 x64 (1803, build 17134, MSEdge test VM, UEFI with OVMF):
+  booted to the desktop under TCG; the driver test was not finished in
+  this round.
+
+
+Windows 7 (2026-11-23)
+
+- Windows 7 SP1 Enterprise x86 (Microsoft's IE11 test virtual machine,
+  vmdk from archive.org, MD5 48f7ab9070c7703cf50634479b8ead38 as
+  published), QEMU 8.2 TCG, system disk on the PIIX3 IDE. Data disks of
+  64 MB with a FAT16 volume and a TAG file each, every one with its own
+  MBR disk signature (Windows 7 keeps disks with equal signatures
+  offline).
+- First build: installed on the PIIX3 function (compatibility mode), the
+  start log showed "IRQ 14 connected (vector 0, IRQL 0)": the Windows 7
+  HAL gives no vector through HalGetInterruptVector, ScsiPort did not
+  start the adapter, and after the restart Windows 7 stopped with 0x7B
+  (0xC0000034).
+- This release: "PnP requirements: compatibility mode: IRQ 14 asked
+  for", "PnP start: 3 descriptor(s), 1 port range(s), 1 interrupt(s)",
+  both disks of channel 0 found, channel 0 interrupt-driven; after the
+  restart Windows 7 booted from IDENT (system disk on the PIIX3,
+  DriverEntry in the boot log).
+- An ICH5 PATA function in native mode (8086:24DB) with a data disk:
+  installed with instdrv, disk online, TAG.TXT read.
+- Windows 2000 SP4: IDENT installed on the PIIX3 (system disk on
+  AHCINT), NVMENT and MMCSDNT on their controllers; after the restart
+  all four volumes had letters and their TAG.TXT were read. XP x64 with
+  the test-signed amd64 build: the same.
+
+
+Issue #4 fixes for every legacy-mode function (2026-11-22)
+
+- The 1.3-4 changes (bus-master mapping check, claim in HwInitialize,
+  150 ms floating-status wait) now apply to every compatibility-mode PCI
+  function and every chip. NT 3.51 (MPS HAL, 2 CPUs) on the ICH5 PATA
+  model, no PIIX IDE: logon reached, both channels.
+- JMicron JMB362B/C (197B:2362/236F) with the IDE class code and an
+  ABAR: no longer taken by IDENT; AHCINT takes it.
+
+
+ICH5 Enhanced Mode, NT 3.51 SP5, AIMB-865 resource registration
+2026-11-18, issue #4, hardware trace at 14:45 UTC
+https://github.com/ages2001/IDENT/issues/4#issuecomment-6981935099
+
+On the physical board the primary PATA function was found. Its bus-master
+ports at FC00h could not be mapped. ScsiPort returned C0040003h
+(IO_ERR_CONFIGURATION_ERROR) from the PCI pass. The ISA pass initialized
+only port 170h, the CF card and optical drive. The boot SSD is on port
+1F0h. There was no reset or IDENTIFY trace for that channel. The log
+does not establish why this particular HAL configuration rejected FC00h.
+
+QEMU 10.0.13, Q35/SeaBIOS, NT 3.51 SP5 MPS HAL, two virtual CPUs.
+PATA primary master = NT boot disk, primary slave = second disk,
+secondary master = disk, secondary slave = ATAPI CD. Native SATA had a
+disk on each channel. The aimb-resources=on model sets PATA BAR4 to
+FC00h, IDETIM high bytes to E3h/E3h and the cable bits to 30h. The
+guest reported PATA 24DB, progif 8Ah, MAP 00h. The board reported PCI
+command 0007h and the QEMU guest initially reported 0103h. These tests
+use Q35 firmware and virtual drives.
+
+  EISA mapping of FC00h-FC0Fh       Earlier diagnostic        Update
+  Available                         NT logon, primary UDMA 5  Same
+  Denied on first and later use     STOP 7B / C0000034h       NT logon
+  Accepted once, denied at report   --                        NT logon
+  100 ms reset + 400 ns stale ATA
+  status, normal mapping, release   --                        NT logon
+  Standard PC/PIIX3, release        --                        NT logon
+
+With the denial in effect, the earlier diagnostic printed the same
+mapping error and C0040003h (PCI), 00000000h (ISA) as the board. Only
+the legacy secondary channel started. The updated diagnostic logged ISA
+PIO at 01F0h and 0170h, enrolled both native SATA channels and returned
+00000000h from the PCI pass. Both updated binaries reached logon.
+The separate late-denial test let the initial mapping succeed and then
+rejected the resource report. The updated ISA pass recovered 1F0h and
+170h and booted. That pass covers the compatibility channels only.
+
+Reproduction builds on the QEMU and guest instructions below. Use
+-icount shift=2,sleep=off and add ,aimb-resources=on to ich5-pata-test.
+Use separate writable overlays for the old and new driver. The board
+profile alone permits the high EISA I/O range in the Q35 guest. To
+reproduce the failure for the supplied NT 3.51 HAL, start QEMU paused
+with -S -gdb tcp:127.0.0.1:1234 and use the following GDB commands.
+Check the HAL image and loaded address before using this breakpoint.
+HAL.DLL SHA-256
+62279a1b57bd4903294e8a3339fd5adb2819cfa9b7a2bdadb4209dc8c20838e6
+
+  set architecture i386
+  target remote 127.0.0.1:1234
+  hbreak *0x80006fab
+  commands
+    silent
+    if $ecx == 2 && $edx == 0 && *(unsigned int*)($ebp+20) == 0 && *(unsigned int*)($ebp+16) >= 0xfc00 && *(unsigned int*)($ebp+16) < 0xfc10
+      set $edx = 0x7fffffff
+    end
+    continue
+  end
+  continue
+
+The breakpoint is at HalTranslateBusAddress+0Bh in the test guest,
+immediately before the HAL looks up the bus handler. It substitutes
+an absent bus number only for EISA bus 0 in the specified range.
+NT's HAL and ScsiPort then return their own failure codes. For the
+late-denial variant, let the first matching translation proceed.
+Omit the breakpoint for the normal DMA control. No OS files were
+changed for the injection. The QEMU screens are in
+tests/ich5/resources-before.png and resources-after.png.
+
+Updated bin/NT/ident.sys SHA-256
+8de93d7980cdd90c6ae55a3dbb5b9c811c86c75bf69243b027fa1f5afc2709eb
+Updated bin/NT/diagnostic/ident.sys SHA-256
+0e48f221507a886ba6e140f8193b6bc945f596175654d1a6e7a71cc30b19b99d
+Earlier diagnostic from the previously published ICH5-PATA archive
+94994833d90d3f0e66cfa6f32f4be90251893df157495a2e34dba8a5370cd108
+
+ICH5 Enhanced Mode, NT 3.51 SP5, command timing and cable selection
+2026-11-18, issue #4
+
+QEMU 10.0.13, Q35 and SeaBIOS, MPS HAL, Enhanced Mode, primary PATA
+master unless noted. All guests used overlays of the same NT installation
+described below. Only the driver was replaced. The previous binary was
+the 150 ms reset-recovery build, SHA-256 58a4acb5...b11aef0c5 (full
+hash in the reset results below). The report on the physical AIMB-865
+contains a STOP code but no ATA status trace or cable measurement.
+
+                                             Previous      New
+  Normal command status, 80-wire host        NT logon      NT logon
+  Stale status 400 ns, 80-wire host          STOP 0x7B     NT logon
+  Normal command status, 40-wire host        NT logon      NT logon
+    Measured primary master mode             UDMA 5        UDMA 2
+  400 ns, 40-wire, 100 ms reset, secondary   --            NT logon
+  Standard PC/PIIX3                          --            NT logon
+
+The STOP screen also reports C0000034h. Boot screenshots are in
+tests/ich5/command-before.png and command-after.png. In the diagnostic
+build we also captured the NT boot-screen text showing PCI function
+24DB, primary ports 1F0h, IRQ 14, a completed reset, disk capacity and
+UDMA 5 with the 80-wire host setting.
+
+To reproduce, build the patched QEMU and prepare copies of the guest
+with the old and new bin/NT/ident.sys as described in the reset test
+below. Use -icount shift=2,sleep=off for the ICH5 command timing tests.
+Replace the PATA device option in that command with the following:
+
+  -device ich5-pata-test,id=pata,addr=1f.1,post-command-status-ns=400
+
+Set the property to 0 for the control. Add ,cable80=off for a 40-wire
+host indication. The emulated disk still sets bit 13 of IDENTIFY word
+93. For the combined stress test also add ,post-srst-float-ms=100
+and attach the boot disk to bus=pata.1. The primary 40-wire comparison used
+-icount shift=auto,sleep=off. The PC/PIIX3 case used the standard QEMU
+pc machine, ide.0 and the same automatic clock setting.
+
+The timing property returns the pre-command Status and Alternate Status
+during the specified interval of virtual time. A normal Status read
+still acknowledges the interrupt. The register values below were read
+after logon through PCI config ports CF8h/CFCh at 00:1f.1.
+
+  Driver / channel / cable     54h IOCFG   48h UDMACTL   4Ah UDMATIM
+  Previous primary 40-wire        1000          01             0001
+  New primary 40-wire             0000          01             0002
+  New primary 80-wire             10F0          01             0001
+  New secondary 40-wire           0000          04             0200
+
+Linux v6.12 ata_sff_exec_command calls ata_sff_pause, which reads
+alternate status and waits 400 ns. IDENT now uses the NT stall primitive
+with its one-microsecond resolution before polling. ich_pata_cable_detect
+uses the channel bits at PCI offset 54h. cable_is_40wire honors a host
+40-wire indication. UniATA IssueIdentify also checks status and waits
+for the data phase during device discovery.
+https://github.com/torvalds/linux/blob/v6.12/drivers/ata/libata-sff.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/ata/ata_piix.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/ata/libata-core.c
+https://github.com/reactos/reactos/blob/master/drivers/storage/ide/uniata/id_ata.cpp
+
+Release driver SHA-256
+aa1e94a01c506ca23ea56c4b38f5744cd5721ecb75f0d4f3fd8580be46517327
+
+These results reproduce a cause of 0x7B and check the programmed UDMA
+mode. Electrical cable errors, the AIMB-865 BIOS, interrupt tables and
+the reporter's disk have not been reproduced. A boot on the reported
+board or its diagnostic trace is needed to establish the physical result.
+
+ICH5 Enhanced Mode, NT 3.51 SP5 (earlier reset test, 2026-11-18)
+
+The reporter confirmed that the previous 1.3 test build boots on the
+ASUS P8B75-M. The AIMB-865 still stopped with 0x7B in Enhanced Mode
+with its boot disk on PATA. The report gives no post-reset status trace.
+https://github.com/ages2001/IDENT/issues/4
+
+Guest: FAT16 partition 1, MBR, the supplied NT 3.51 SP5 system files,
+HALMPS.DLL and NTKRNLMP.EXE. NT reported one active processor. The
+ident boot service used the SCSI Miniport group, tag 40, BusType 5,
+NumberOfRequests 32 and MaximumSGList 512. Scsidisk was boot-start.
+Atdisk and atapi were disabled. All final comparisons used ident.sys
+under its own name. The installation and load settings were identical.
+
+Host: QEMU 10.0.13 (TCG), Q35, SeaBIOS, 64 MB, two virtual CPUs.
+The patch in tests/ich5 adds the Enhanced Mode IDE functions. PATA
+8086:24DB at 00:1f.1 decodes both legacy channels and uses IRQ 14/15.
+SATA 8086:24D1 at 00:1f.2 has two native channels on distinct I/O
+BARs, PCI INTA and MAP 0. Both functions support bus-master IDE.
+The host bridge, LPC, firmware and interrupt tables are Q35/SeaBIOS.
+The test covers storage enumeration and reset recovery. The AIMB-865
+BIOS, electrical PATA timing and its installed disk were unavailable.
+
+The optional post-srst-float-ms property makes the PATA task-file and
+alternate-status reads return FFh and ignores task-file writes for the
+specified interval after SRST release. It defaults to zero. The 100 ms
+value exercises delayed register availability. It is a fault injection,
+not a measurement from the board. Linux also allows a settling interval
+in ata_sff_wait_after_reset before examining status.
+https://github.com/torvalds/linux/blob/master/drivers/ata/libata-sff.c
+
+  Driver and controller                  Post-SRST interval   Boot result
+  Previous 1.3 binary, primary PATA                     0 ms   NT logon
+  Previous 1.3 binary, primary PATA                   100 ms   STOP 0x7B
+  Previous source, rebuilt*, primary PATA             100 ms   STOP 0x7B
+  Updated 1.3, primary PATA                           100 ms   NT logon
+  Updated 1.3, secondary PATA                         100 ms   NT logon
+  Updated 1.3, standard QEMU PC/PIIX3                default   NT logon
+
+* Same compiler, DDK headers, link options and other two object files as
+  the updated NT driver. Both failing builds reported INACCESSIBLE_BOOT_DEVICE
+  with second argument C0000034h. See tests/ich5/before.png and after.png.
+  The updated NT PE32 image uses subsystem native 3.50, version 1.3.0.0.
+  SHA-256: 58a4acb53443d3de6956a9c5b44954fc5a582c560e69b773067c393b11aef0c5
+
+To reproduce on a machine with a QEMU build environment, apply the
+patch to QEMU 10.0.13 and build qemu-system-i386. The test build used
+Debian's 10.0.13+ds sources and the packaged SeaBIOS and VGA ROMs.
+From the QEMU source directory, with PROJECT pointing at IDENT-v1.3:
+
+  patch -p1 < "$PROJECT/tests/ich5/qemu-10.0.13-ich5.patch"
+  mkdir -p build-ich5 && cd build-ich5
+  ../configure --target-list=i386-softmmu --enable-tcg --disable-docs
+  ninja qemu-system-i386
+
+Place the supplied NT351-IDENT-v1.3.qcow2 beside the test command, or
+set image to its full path. For the original-driver run, make a test
+copy with the previous archive's bin/NT/ident.sys using mtools:
+
+  image=NT351-IDENT-v1.3.qcow2
+  qemu-img convert -O raw "$image" previous.raw
+  mcopy -o -i previous.raw@@32256 /path/to/previous/ident.sys \
+    ::/WINNT351/system32/drivers/ident.sys
+  qemu-img convert -f raw -O qcow2 previous.raw previous.qcow2
+
+Run the following once per case, selecting the corrected or previous
+image and the interval from the table. Use the SeaBIOS and VGA ROMs
+installed with QEMU. A headless run can use -display none and the HMP
+screendump command. For Debian source builds without bundled ROMs add
+-L /usr/share/seabios -L /usr/share/qemu -bios /usr/share/seabios/bios-256k.bin.
+
+  ./qemu-system-i386 -machine q35,sata=off -cpu pentium2 -smp 2 -m 64 \
+    -nodefaults -vga std -nic none -rtc base=2001-01-01 \
+    -icount shift=auto,sleep=off -snapshot \
+    -device ich5-pata-test,id=pata,addr=1f.1,post-srst-float-ms=100 \
+    -device ich5-sata-test,id=sata,addr=1f.2 \
+    -drive if=none,id=d,format=qcow2,file="$image" \
+    -device ide-hd,drive=d,bus=pata.0,unit=0,bootindex=1
+
+Model of the reporters' boards (IDENT GitHub issue #4, follow-up; 2026-11-16)
+
+The reporter tried the first 1.3 build: still 0x7B on NT 3.51 on the ICH5
+board, and also on an ASUS P8B75-M (Intel B75, SATA in IDE mode, a patched
+scsiport.sys). Both run halmps.dll. The earlier test (a PIIX3 shown with
+ICH5 IDs) left out most of what is different on those boards, so the
+patched QEMU 8.2 got a model of the functions themselves (device "ich-ide",
+and "ich-stub" for the other functions of the boards):
+
+- the PIIX3 IDE function left out (QEMU_NO_PIIX_IDE), the model at 00:1F.x
+  with an LPC bridge stub at 1F.0, SMBus at 1F.3 (32-byte I/O BAR) and a
+  display controller with a 64-byte I/O BAR, as on the boards
+- IDETIM decode enable and the command register's I/O enable gate a
+  channel (not decoded at all when off); compatibility channels on
+  1F0h/3F6h and 170h/376h only for the legacy channels the function owns
+  (combined mode: MAP 4/5 SATA primary, 6/7 SATA secondary); native
+  channels on BARs 0-3 with INTA, compatibility channels on IRQ 14/15
+- what the board's BIOS leaves: decode enables of the channels in use,
+  DMA-capable bits of the drives, native BARs where it allocated them
+  (SeaBIOS would move them to 1F0h/3F4h/170h/374h)
+- SATA: a port without a device reads 7Fh; PCS shows the ports in use;
+  ICH5 P0/P1 (combined: master/slave of the SATA channel), PCH 1E00
+  P0/P2 primary, P1/P3 secondary, 1E08 P4/P5
+- drives busy for 300 ms after a software reset
+
+NT 3.51 SP5, halmps.dll + ntkrnlmp.exe as on the boards, -smp 2 (the HAL
+starts one processor in QEMU), IDENT as the "ident" service with what
+oemsetup.inf writes (Tag 40, Parameters BusType 5, Parameters\Device
+NumberOfRequests 32 / MaximumSGList 512), release build:
+
+  A  ICH5 PATA 8Ah + SATA 24D1 native (8Fh), system on PATA primary   boots
+  B  ICH5 combined MAP 6 (PATA primary, SATA secondary)              boots
+  C  ICH5 combined MAP 4 (SATA primary, PATA secondary), system on
+     PATA secondary                                                   boots
+  E  B75 1E00 legacy (8Ah) + 1E08 native (85h), system on port 0      boots
+  F  B75 1E00 native (8Fh) + 1E08 native                              boots
+  G  as E with a 300 GB disk and 2 GB of memory                       boots
+  H  as A with two PCI-PCI bridges and functions behind them          boots
+  J  as E, bus master DMA (UDMA 5) on both functions                  boots
+  L  as E with the system disk on 1E08 (port 4) and another disk on
+     port 0: NT 3.51 matches the boot disk by signature               boots
+  Every case: nvqi shows one IDENT adapter per channel in use,
+  interrupt-driven, no DMA errors; the FAT disk on the other function
+  readable.
+
+Found on the way: in E/F/G/J IDENT moved the native SATA functions to
+other ports. Their BARs sat next to a 64-byte display BAR at C000h, whose
+size the scan bounds by its alignment (100h); a build with the old rule
+logged "Ports: bus 0 slot 000000BF native channels moved from C090 to
+C400" for 1E08. On the boards the same happens with the display BAR at
+F000h. The move itself worked in QEMU,
+but it was never needed: since this build only another IDE channel on
+the same ports counts as a conflict. 0x7B itself did not show in any
+model case. The diagnostic build (IDENT-v1.3-diag-NT.zip, ident.sys with
+every IDE_DBG line on the boot screen and on COM1 at 115200 baud) was
+checked in case A: the FindAdapter, reset, IDENTIFY and mode lines show
+during boot and reach COM1.
+
+Channels turned off, ICH5 combined mode (IDENT GitHub issue #4; 2026-11-13)
+
+- QEMU 8.2 has no ICH5 and no combined mode. Test hooks in the patched
+  QEMU: the PIIX3 shown as the ICH5 PATA function (8086:24DB rev 02),
+  and one channel's IDETIM decode enable (41h/43h bit 7) held at 0, with
+  that channel's ports not decoded at all (as on the board, where the
+  SATA function answers there instead).
+- Windows NT 3.51 (MPS uniprocessor HAL, IDENT as Ultra124, -icount),
+  release build:
+  - secondary off, system disk on the primary: boots; nvqi "Scsi0: IDENT
+    channels 1"; no second adapter, no ISA channel at 170h.
+  - primary off, system disk on the secondary: boots from it; one
+    adapter, one channel; 1F0h not taken as an ISA channel.
+  - both on (control): two adapters, the data disk on the secondary
+    channel readable (dir).
+- Combined mode with two functions: a second PIIX3 function added
+  (-device piix3-ide), the first shown as 8086:24DB with only its
+  primary channel decoding, the second as 8086:24D1 (ICH5 SATA, MAP 0)
+  with only its secondary channel; the hook sets the decode enable of
+  the channels left on, as the board's BIOS does (SeaBIOS does it for
+  the PIIX3/PIIX4 IDs only, and with 0 in both bits IDENT took no
+  channel at all, as Linux would).
+  - Windows 2000 (both functions bound to IDENT with instdrv): "PnP
+    start: ... first legacy channel in use: IRQ 14" for the first and
+    "IRQ 15" for the second; both adapters started, one channel each,
+    both interrupt-driven (nvqi: 23068 and 211 interrupts), bench OK on
+    the primary disk, the FAT disk on the second function's channel
+    readable (PIO there: the 24D1 has no timing table in IDENT and
+    SeaBIOS leaves its DMA bits clear).
+  - NT 3.1 (IDENT as Aha154x, system disk on the first function's
+    primary): boots; two IDENT adapters, one channel each, interrupts
+    on both; the FAT disk on the second function's secondary channel
+    readable as D:.
+- Regression with these builds: XP x64 (system disk on IDENT): trimnt
+  on IDE, AHCI, SD and NVMe ("trimmed 199 / 196 / 127 / 199 MB"),
+  BENCH OK, IDENT channels 2. Windows 2000: trimnt on the four disks,
+  BENCH OK. NT 4.0 SP1: trimnt on AHCI, IDE and NVMe trimmed 159 MB
+  each, BENCH OK, IDENT channels 1 per adapter.
+  XP x64 again with the final build (IRQ choice at the PnP start):
+  trimmed 199 / 196 / 127 / 199 MB, BENCH OK, cdichk OK. Windows 95
+  (IDENT9X on the PIIX3, data disk on the secondary): fio95 40 MB FIO
+  OK, no errors, FC no differences.
+
+TRIM mode and trimnt (IDENT GitHub issue #2; 2026-11-09)
+
+- QEMU 8.2, disks with discard=unmap on raw image files that were filled
+  with random data before partitioning, so that every block of the image
+  was allocated; one FAT16 partition each. Space given back by the
+  emulated disk shows as a smaller allocation of the image file (du).
+- Windows 2000 (w2k-hib, the four 1.3/1.8/3.3 release drivers): 200 MB
+  disks on AHCI port 1 (AHCINT), the PIIX3 primary master (IDENT) and
+  NVMe (NVMENT), a 256 MB SD card on sdhci-pci (MMCSDNT). trimnt D: to
+  G: found each disk's adapter and address through
+  IOCTL_SCSI_GET_ADDRESS ("D:\ is on Scsi0: path 0 target 1 lun 0",
+  ...), switched TRIM mode on on that adapter only, filled 199 MB (SD:
+  255 MB), "volume full", "trimmed 199 MB" (SD: 255 MB) from
+  TRIM_STATUS. Image files: AHCI 204804 KB -> 3420 KB, IDE 204804 KB
+  -> 8216 KB, NVMe 204800 KB -> 7416 KB. The SD image stayed allocated:
+  QEMU 8.2's SD card model takes ERASE but neither changes nor discards
+  the blocks. fsck.fat -n afterwards: no errors, no files left on any.
+- Fragmented free space: a 32 MB FAT16 volume with 512-byte clusters,
+  10000 files of three sectors, every second one deleted (5000 holes of
+  1.5 KB, plus 17 MB in one piece), on the PIIX3 secondary master
+  (IDENT, Windows 2000): "24 MB free, cluster 512 bytes", "filled 24
+  MB", "trimmed 24 MB": every piece, also those of 1.5 KB starting in
+  the middle of a 4 KB block of the 1 MB buffer, was taken for the
+  pattern. (The host gives back whole 4 KB pages only, so the image
+  shrank from 32768 KB to 14728 KB.)
+- The same disk with discard_granularity=0 (no TRIM in IDENTIFY word
+  169): "the disk takes no TRIM through IDENT (no TRIM support, TRIM=0,
+  or IDENT in PIO mode): nothing to do", nothing written.
+- Windows NT 4.0 SP1, IDENT as atapi.sys, the system disk itself as in
+  the issue (FAT16 C:, 8 KB clusters, 277 MB free, its free space filled
+  with random data on the host first): trimnt c from the Run box,
+  output into a file: "C:\ is on Scsi0: path 0 target 0 lun 0", "Scsi0:
+  IDENT TRIM mode on", "volume full", "filled 277 MB in 1 file(s)",
+  "trimmed 277 MB", "TRIM mode off, files deleted"; image 305004 KB ->
+  100252 KB; the system booted and ran normally afterwards.
+- Windows NT 4.0 SP1 (system disk on AHCI port 0 with AHCINT as
+  atapi.sys, MMCSDNT and NVMENT as further miniport services): 160 MB
+  FAT16 disks on AHCI port 1 and NVMe, a 256 MB SD card: trimnt D:, E:,
+  F: each found its own adapter (Scsi0 AHCINT target 1, Scsi1 MMCSDNT,
+  Scsi2 NVMENT), "volume full", "trimmed 159 MB" / "255 MB" / "159 MB";
+  image files AHCI 163844 KB -> 2940 KB, NVMe 163840 KB -> 6128 KB.
+- Windows XP x64 SP1 (system disk on IDENT, PIIX3 primary master; the
+  release drivers of this version): 200 MB FAT16 disks on the PIIX3
+  secondary master (IDENT), AHCI port 0 (AHCINT) and NVMe namespace 1
+  (NVMENT), a 128 MB SD card (MMCSDNT); trimnt.exe (32-bit, under
+  WOW64): each found its adapter, "volume full", trimmed 199 / 199 /
+  199 / 127 MB; image files 204800 KB -> 2624 KB (IDE), 2624 KB (AHCI),
+  7416 KB (NVMe).
+- Windows 2000, the final builds, two runs (Windows gave the FAT disk
+  of the PIIX3 secondary master no letter in the first, the one on AHCI
+  port 1 none in the second): AHCI port 1, the PIIX3 secondary master,
+  NVMe namespace 1 and the SD card each "volume full" and trimmed in
+  full (AHCI and IDE 204800 KB -> 3420 KB, NVMe -> 7416 KB).
+
+Throughput 1.3 against 1.2 (IDENT GitHub issue #2; 2026-11-09)
+
+- bench.exe on a 256 MB disk on the PIIX3 primary master (raw
+  \\.\PhysicalDrive1, 64 MB area; write stamped data, read it back and
+  compare, sequential and random reads at queue depths 1-32), QEMU TCG,
+  so the figures carry the emulator's noise; every run 0 errors, 0 bad.
+- Windows 2000 (w2k-hib), two runs of 1.3, one of 1.2:
+  1 MB sequential reads, queue depth 1: 278 / 332 / 457 MB/s and
+  233 / 428 / 495 MB/s against 122 / 173 / 187 MB/s; depth 4: 332 /
+  443 / 337 and 191 / 311 / 365 MB/s against 132 / 149 / 190 MB/s;
+  64 KB random and sequential writes at depth 8: 67 / 66 and 58 / 68
+  MB/s against 63 / 55 MB/s; 4 KB random reads about the same (1100-
+  1200 IOPS).
+- Windows NT 4.0 SP1 (IDENT as atapi.sys, FAT16 system disk on the
+  primary master, the bench disk on the secondary master), one run
+  each, started from the Run box: 1 MB sequential reads at depth 1
+  1.47 / 1.32 / 1.69 against 0.91 / 0.85 / 0.83 "GB/s", at depth 4
+  2.23 / 2.26 / 2.71 against 0.93 / 1.11 / 1.08; 64 KB writes at depth
+  8 356 / 361 against 240 / 304 "MB/s"; 4 KB random reads 9-12k IOPS
+  both. NT 4.0's performance counter runs fast under TCG, so only the
+  ratios mean anything: queued requests (new on NT 3.1-4.0) and 512 KB
+  per request about double the large transfers.
+- Pieces: a test build that set a per-command limit of 24 sectors on
+  every disk (as for the Silicon Image 3112 errata, which up to 1.2
+  were polled), so that every request larger than 12 KB went in pieces
+  chained from the interrupts: bench.exe on Windows 2000 0 errors, 0
+  bad in every pass, including the 128 KB and 1 MB write/verify passes.
+
+Windows NT 4.0 SP1, the four drivers of this release (2026-11-09)
+
+- System disk on AHCI port 0 with AHCINT copied over atapi.sys, MMCSDNT
+  and NVMENT as two further miniport services (Start 0), 64 MB RAM;
+  started from the Run box, results read from the image afterwards.
+- bench.exe (write stamped data, read back and compare, 64 MB area) at
+  the same time on a 256 MB disk on AHCI port 1 (AHCINT, now 512 KB per
+  request with 136-entry command tables on NT 4.0) and a 256 MB NVMe
+  namespace (NVMENT, four I/O queue pairs): BENCH OK, 0 errors, 0 bad on
+  both. QUERY_INFO afterwards: "queues 4 x 64 entries, deepest 32".
+- bench.exe on a 256 MB SD card (MMCSDNT, 512 KB per request, ADMA2
+  with 160 descriptors): BENCH OK, 0 errors, 0 bad.
+- trimnt on FAT16 volumes of all three (see TRIM mode above).
+
+Regression of AHCINT 1.8, IDENT 1.3, MMCSDNT 1.3 and NVMENT
+3.3 together (2026-11-09)
+
+- bench.exe on raw 256 MB disks (write stamped data, read back and
+  compare; sequential and random, queue depths 1-32), while trimnt
+  filled 200 MB FAT16 disks of each driver (see TRIM above), QEMU 8.2.
+- Windows XP x64 SP1: IDENT system disk (PIIX3 primary master), bench
+  at the same time on the PIIX3 secondary slave (IDENT), AHCI port 1
+  (AHCINT) and NVMe namespace 2 (NVMENT, four I/O queue pairs, deepest
+  queue 32): BENCH OK on all three. cdichk64.exe and cdichk.exe (WOW64),
+  the CrystalDiskInfo paths through \\.\PhysicalDriveN: ATA_PASS_THROUGH
+  IDENTIFY / SMART RETURN STATUS / SMART READ DATA / READ LOG EXT /
+  CHECK POWER MODE, DFP IDENTIFY / READ DATA / THRESHOLDS / ENABLE and
+  IDE_PASS_THROUGH OK on the three IDENT disks and the AHCINT disk, the
+  NVMe namespaces as "NVMe QEMU NVMe Ctrl" with NvmeMini IDENTIFY and the
+  health log OK; the SD card has none (expected). IDENT GET_INFO: 3
+  interrupts that came into a running routine of the driver during the
+  run (see IDENT 1.3), handled; no errors.
+- Windows 2000 SP4 (system disk on AHCINT): bench at the same time on
+  AHCI port 2 (AHCINT), the PIIX3 primary master (IDENT) and NVMe
+  namespace 2 (NVMENT): BENCH OK on all three; cdichk.exe OK as on
+  XP x64.
+- Windows NT 4.0 SP1: see "Windows NT 4.0 SP1, the four drivers of this
+  release" (AHCINT, MMCSDNT, NVMENT) and the IDENT throughput runs.
+- Windows NT 3.51 SP5 (-icount shift=auto,sleep=off, which the stock
+  NT 3.x kernels need in this emulator): system disk on AHCI port 0
+  with AHCINT as atapi.sys, IDENT, NVMENT and MMCSDNT as three further
+  miniport services. trimnt D: (200 MB FAT16 on the PIIX3 secondary
+  master, IDENT with queued requests): "volume full", "trimmed 199 MB",
+  image 204800 KB -> 3420 KB. bench.exe one after the other on AHCI
+  port 1 (AHCINT), the PIIX3 primary master (IDENT), the NVMe namespace
+  (NVMENT, 4 queues x 64, deepest 12) and the SD card (MMCSDNT): BENCH
+  OK on all four.
+  The first boot of that setup with IDENT 1.2's logic turned the
+  "atapi" service (AHCINT) off and the next boot stopped with 0x7B; with
+  NotInboxDriver (see IDENT 1.3) it is left alone. NT 4.0 SP1 with
+  the same set (AHCINT as atapi, IDENT added): after two boots "atapi"
+  still Start 0 with NotInboxDriver 1, IDENT saved only atdisk.
+- Windows NT 3.1 (stock kernel, -icount): system disk on the PIIX3
+  primary master through IDENT (queued requests and 512 KB per request
+  now on NT 3.1 too; atdisk off, scsidisk a boot driver), a 256 MB disk
+  on the secondary master: boots to the logon screen. The keyboard did
+  not answer in this setup, so nothing was run after the logon screen.
+- Windows 95 (system disk on the PIIX3 IDE, the ICH9 AHCI shown as
+  ICH8M with prog-if 0, a 64 MB FAT disk on AHCI port 1, AHCINT9X of
+  this version): copy to D: and FC /B of WIN.COM and REGEDIT.EXE: no
+  differences. IDENT9X, MMCSD9X and NVMENT9X were not run in this
+  round.
+
+Short round on every system, release builds (2026-11-09)
+
+- The binaries of bin\ (AHCINT 1.8, IDENT 1.3, NVMENT 3.3,
+  MMCSDNT 1.3), QEMU 8.2. TRIM disks: random-filled raw images with
+  one FAT partition (discard=unmap); bench disks: 256 MB raw images
+  (write, verify, sequential and random reads at queue depth 1 to 32,
+  random writes, queued verify).
+- Windows 2000 (system disk on AHCI): trimnt on AHCI (FAT32), IDE, NVMe
+  and SD: "volume full", trimmed 196 / 199 / 199 / 127 MB; images
+  204800 KB -> 6460 / 3420 / 7416 KB (the SD image stays allocated, as
+  before). bench on AHCI, IDE and NVMe: BENCH OK. cdichk: all SMART paths
+  OK on the ATA disks, NvmeMini identify and health log on both NVMe
+  namespaces. NVMENT: 4 queues x 64 entries, deepest 16.
+- XP x64 (system disk on IDE through IDENT): the same; trimmed 199 (IDE)
+  / 196 (AHCI, FAT32) / 127 (SD) / 199 (NVMe) MB, BENCH OK on AHCI, IDE
+  and NVMe, cdichk64 and cdichk (WOW64) alike, IDENT nested 0.
+- Windows NT 4.0 SP1 (AHCINT as atapi.sys on the system disk, IDENT as
+  Ultra14f, NVMENT as Ultra24f, MMCSDNT as Ultra124): trimnt on AHCI,
+  IDE and NVMe trimmed 159 MB each (images 163840 KB -> 2940 / 2940 /
+  6128 KB); bench OK on AHCI, IDE, NVMe and SD.
+- Windows NT 3.51 (same mapping, -icount): trimnt on AHCI, IDE and NVMe
+  trimmed 159 MB each; bench OK on AHCI, IDE, NVMe and SD.
+- Windows NT 3.1 (IDENT as Aha154x on the system disk, AHCINT as
+  Ultra124, MMCSDNT as Ultra14f, NVMENT as Ultra24f; no -icount: with
+  it NT 3.1 ignores the keyboard at the logon box, without it the logon
+  works): trimnt stopped at once with "write error 123": its file names
+  (TRIM00000.TMP) were not 8.3, and FAT on NT 3.1 has no long names.
+  With TRIM0000.TMP .. TRIMFFFF.TMP: trimmed 159 MB on IDE, AHCI and
+  NVMe. bench OK on SD and NVMe; on IDE and AHCI the 1 MB reads at queue
+  depth 4 had requests that ReadFile refused at once with error 8
+  (ERROR_NOT_ENOUGH_MEMORY, before the driver saw them; no wrong data).
+  IDENT 1.2 with AHCINT 1.7 gave the same, more often (64 MB
+  guest). The first boot with AHCINT loading before IDENT stopped with
+  0x7B: on NT 3.x the first adapter that loads holds Harddisk0, which
+  multi(0)disk(0)rdisk(0) names, so the driver of the system disk has to
+  load first (lowest Tag in its group).
+- Windows 95 RTM (system disk on the PIIX3): MMCSD9X and NVMENT9X
+  installed through New Hardware Found (Have Disk), IDENT9X on the PCI
+  IDE controller (Device Manager, Change Driver, Have Disk; the system
+  disk and a data disk on the secondary channel then run through it,
+  Performance: "configured for optimal performance"). fio95 (a 40 MB
+  file written in 64 KB pieces, read back and compared, 2000 random 4 KB
+  rewrites, compared again; tools of the test bench) on a 64 MB FAT16
+  data disk of each: AHCINT9X, IDENT9X, MMCSD9X, NVMENT9X FIO OK, no
+  errors, no bad data (write 10.9 / 13.8 / 2.5 / 9.1 MB/s, 500 / 908 /
+  352 / 456 random writes per second). Copy and FC /B of WIN.COM and
+  REGEDIT.EXE as well: no differences.
 
 Hibernation on Windows 2000 and XP x64 (2026-11-03)
 
@@ -37,7 +646,7 @@ Hibernation on Windows 2000 and XP x64 (2026-11-03)
   resumepassword, XP x64) the same program powered off at once after a
   resume. Windows behaviour, not the drivers'.
 
-IRQ 15 on XP x64, SMART through the disk on XP x64 (added to 1.2.0.0,
+IRQ 15 on XP x64, SMART through the disk on XP x64 (added to 1.2,
 2026-11-03)
 
 - XP x64, debug build, PIIX3 in compatibility mode: "PnP start: IRQ 15
@@ -83,7 +692,7 @@ IRQ 15 on XP x64, SMART through the disk on XP x64 (added to 1.2.0.0,
   and FC, SMART, hot plug and card change as before.
 
 Secondary channel interrupt on 2000/XP, ALi timing, PIO= (added to
-1.2.0.0, 2026-11-02)
+1.2, 2026-11-02)
 
 - Windows 2000 (ACPI HAL), PIIX3 in compatibility mode, debug build:
   "PnP start: IRQ 15 connected (vector 92, IRQL 8, through a DPC),
@@ -115,7 +724,7 @@ Secondary channel interrupt on 2000/XP, ALi timing, PIO= (added to
   SMART of master and slave: all as before.
 
 Interrupt completion, VIA/AMD/nVidia timing, simplex, SPINDOWN, SMART
-(added to 1.2.0.0, 2026-11-02)
+(added to 1.2, 2026-11-02)
 
 DMA, PIO, ATAPI and non-data commands (FLUSH, VERIFY, the last chunk of
 a VERIFY) now complete by interrupt where the channel has one; Fast
@@ -158,7 +767,7 @@ instance and the commands at start-up.
   smartt.exe: SMART READ DATA of master and slave through
   \\.\PhysicalDrive0/1 and through \\.\Scsi0: answered (the secondary
   adapter, with only the CD, answers none, as expected).
-- Found in that run: the image no longer booted (0x7B), with the 1.1.0.0
+- Found in that run: the image no longer booted (0x7B), with the 1.1
   build as well. IDENT turns off the in-box atdisk and atapi services
   once it has found a controller; installed under the name atapi (as in
   these test images) it turned off its own service. The driver now
@@ -174,7 +783,7 @@ instance and the commands at start-up.
   program afterwards without error.
 - SPINDOWN=n (IDLE with a standby timer at start-up): not tested.
 
-Hot plug, HOTPLUG=1 (added to 1.2.0.0, 2026-11-02)
+Hot plug, HOTPLUG=1 (added to 1.2, 2026-11-02)
 
 QEMU 8.2.2 patched for these runs: while a file named after a drive's
 serial number exists, that drive reads as pulled (AHCI: PxSSTS DET 0,
@@ -207,7 +816,7 @@ test program writes, reads and verifies the raw disk (queue depths 1 to
 - Stays opt-in (HOTPLUG=1): PATA is not hot-pluggable, and a position
   without a drive can read like the other drive on some controllers.
 
-Additions to 1.2.0.0 (2026-11-02): queued requests, 4K=1, port
+Additions to 1.2 (2026-11-02): queued requests, 4K=1, port
 program, GET_LOCATION
 
 - Queued requests (Windows 2000, PIIX3 in compatibility mode, primary
@@ -237,7 +846,7 @@ program, GET_LOCATION
   link without libgcc (no 64-bit division helpers, whose calling
   convention differs under -mrtd).
 
-Additions to 1.1.0.0 (2026-10-26): OFF=, MPS interrupt check, disks of
+Additions to 1.1 (2026-10-26): OFF=, MPS interrupt check, disks of
 2 TB and more, 32 controllers
 
 - ATAPI device type (reported: a ZIP 100 IDE drive came up as a
@@ -478,7 +1087,7 @@ TRIM, VPD, LOG SENSE, shutdown standby, version resource
   CHKDSK OK; NT 4.0 booting through IDENT (system disk on the PIIX3,
   trimnt switched IDENT's TRIM mode on for it as well); Windows 95
   booting through IDENT9X (sumtool and w95io on the other disks OK).
-- File properties of every binary show version 1.0.0.0
+- File properties of every binary show version 1.0
   (OriginalFilename ident.sys / ident9x.mpd).
 
 Final binaries
@@ -705,14 +1314,14 @@ Memory above 4 GB
   Memory above 4 GB under Windows 2000 needs Advanced Server or
   Datacenter, not tested.
 
-Several controllers in one machine (1.1.0.0)
+Several controllers in one machine (1.1)
 QEMU's SeaBIOS writes 1F0h/3F4h/170h/374h into BAR 0-3 of every native
 IDE function other than the PIIX3. The runs below leave them there (no
 CMD646_BARS), or with CMD646_BARMASK leave one pair there and move the
 other. QEMU then decodes the legacy ports for the CMD646, not for the
 PIIX3: the situation of a machine booted from a native-mode controller
 whose compatibility-mode drives are missing.
-- Before (1.0.0.0 logic, debug build): NT 4.0 booted from the CMD646
+- Before (1.0 logic, debug build): NT 4.0 booted from the CMD646
   primary, k512 on the PIIX3 primary, CD + data1 on the PIIX3
   secondary: the PIIX3 channel at 1F0 reported 1 device (the CMD646's
   system disk), the one at 170 none, DMA errors and PIO for the system
@@ -762,7 +1371,7 @@ whose compatibility-mode drives are missing.
   system from the CMD646 disk; GUI-mode setup reached Regional Options.
 - Windows 95, IDENT9X, system on the PIIX3 secondary master, the CD as
   slave, data1 on the PIIX3 primary, w512 on the CMD646 primary left at
-  1F0h/3F4h (CMD646_BARMASK=c). As 1.0.0.0, the release build leaves
+  1F0h/3F4h (CMD646_BARMASK=c). As 1.0, the release build leaves
   the CMD646 where it is on 9x. A trial build that moved it there too
   ("moved from 1F0 to C400", after reading the other functions through
   CF8h/CFCh: the 9x ScsiPortGetBusData reads only the device node's own
@@ -784,13 +1393,13 @@ whose compatibility-mode drives are missing.
   write reaches both devices); now "Channel 0.1: ATAPI, 12-byte
   packets", 2 devices. Windows 95 the same (system disk master, CD
   slave on the PIIX3 secondary): "Channel 1.1: ATAPI", 2 devices.
-- File properties of every binary show version 1.1.0.0 (ident.sys x86
+- File properties of every binary show version 1.1 (ident.sys x86
   and x64, ident9x.mpd). The NT build imports nothing NT 3.1 lacks
   (checked against NT 3.1's own exports); the 2000/XP builds also
   import HalGetBusDataByOffset and HalSetBusDataByOffset, exported by
   the Windows 2000 and XP x64 HALs.
 
-CD-ROM drives on NT 3.1, drive positions, shutdown (1.1.0.0 update)
+CD-ROM drives on NT 3.1, drive positions, shutdown (1.1 update)
 Reported: on a VIA P4M800Pro-M board (VT8237 south bridge), the CD-ROM
 drive on the primary master was missing in NT 3.1's File Manager.
 - NT 3.1, system disk on AHCI, debug build, drive letters and CD-ROM
@@ -828,7 +1437,7 @@ drive on the primary master was missing in NT 3.1's File Manager.
   master, and now gets the two IDENTIFY commands: "Channel 0.1: no
   answer (status 00)", no reset, nothing found there, as before.
 - Standby at shutdown off by default (STANDBY=1 to turn it on), as in
-  AHCINT 1.6.0.0: XP x64, all four drivers, debug builds, shutdown
+  AHCINT 1.6: XP x64, all four drivers, debug builds, shutdown
   through NtShutdownSystem: powered off after 10 s, no IDENT standby
   line; with DriverParameters STANDBY=1 "Channel 0.0: standby for
   shutdown", powered off after 10 s.

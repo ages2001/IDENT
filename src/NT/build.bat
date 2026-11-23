@@ -13,7 +13,10 @@ if exist idecmd.obj del idecmd.obj
 if exist idesatl.obj del idesatl.obj
 if exist ident.sys del ident.sys
 
-cl -nologo -c -Gz -Ox -W3 -Zp8 -Zi -DIDE_NT4 -D_X86_=1 -Di386=1 -DCONDITION_HANDLING=1 -DNT_UP=1 -DNT_INST=0 -DWIN32=100 -D_NT1X_=100 -DWINNT=1 -D_WIN32_WINNT=0x0350 /I.. /I..\inc ..\idemain.c ..\idecmd.c ..\idesatl.c
+set IDENT_TRACE_FLAG=
+if "%IDE_BOOT_TRACE%"=="1" set IDENT_TRACE_FLAG=-DIDE_BOOT_TRACE
+
+cl %IDENT_TRACE_FLAG% -nologo -c -Gz -Ox -W3 -Zp8 -Zi -DIDE_NT4 -D_X86_=1 -Di386=1 -DCONDITION_HANDLING=1 -DNT_UP=1 -DNT_INST=0 -DWIN32=100 -D_NT1X_=100 -DWINNT=1 -D_WIN32_WINNT=0x0350 /I.. /I..\inc ..\idemain.c ..\idecmd.c ..\idesatl.c
 if errorlevel 1 goto error
 
 rc -r -foident.res ..\ident.rc

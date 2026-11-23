@@ -102,6 +102,15 @@ IdeResetChannel(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel)
     /* Both devices: BSY may take long after a reset (spin-up) */
     for (ms = 0; ms < IDE_RESET_TIMEOUT_MS; ms++) {
         status = IdeAltStatus(ch);
+        /* A disk can leave the bus floating during SRST recovery (seen on
+           an ICH5 PATA channel, GitHub issue #4; a property of the drive,
+           not of the chip). Allow the 150 ms settling interval of Linux's
+           ata_sff_wait_after_reset before an empty status counts. A ready
+           disk proceeds at once; BSY keeps the normal spin-up timeout. */
+        if ((status == 0xFF || status == 0) && ms < 150) {
+            ScsiPortStallExecution(1000);
+            continue;
+        }
         if (status == 0xFF || !(status & IDE_STS_BSY)) break;
         ScsiPortStallExecution(1000);
     }
@@ -228,6 +237,17 @@ IdePrepareDma(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_CHANNEL Ch, IN PSCSI_REQUE
     return TRUE;
 }
 
+/* A host read flushes the write. NT can stall in whole microseconds.
+   ATA status from before the command/PIO phase may persist for 400 ns. */
+#ifdef IDE_NT31_COMPAT
+static VOID
+IdePauseTaskFile(IN PIDE_CHANNEL Ch)
+{
+    (VOID)IdeAltStatus(Ch);
+    ScsiPortStallExecution(1);
+}
+#endif
+
 /* Write the task file and the command register */
 static VOID
 IdeWriteTaskFile(IN PIDE_CHANNEL Ch, IN PATA_REQUEST Req, IN BOOLEAN UseDma)
@@ -300,6 +320,9 @@ IdeSendPacket(IN PIDE_CHANNEL Ch, IN PATA_REQUEST Req, IN ULONG TimeoutUsec)
         ((PUCHAR)packet)[i] = Req->Cdb[i];
     }
     IDE_OUTSW(Ch->Cmd + IDE_REG_DATA, packet, words);
+#ifdef IDE_NT31_COMPAT
+    IdePauseTaskFile(Ch);
+#endif
     return TRUE;
 }
 
@@ -394,6 +417,9 @@ IdeRunCommand(
     }
 
     IdeWriteTaskFile(ch, Req, useDma);
+#ifdef IDE_NT31_COMPAT
+    IdePauseTaskFile(ch);
+#endif
 
     if (Req->IsAtapi && !IdeSendPacket(ch, Req, timeoutUsec)) {
         status = IdeAltStatus(ch);
@@ -468,8 +494,11 @@ IdeRunCommand(
                 break;
             }
             IdePioBlock(ch, Req->IsAtapi, Req->IsWrite, &buffer, &left, blockSize);
-            /* Give the device its 400 ns before the status is read again */
+#ifdef IDE_NT31_COMPAT
+            IdePauseTaskFile(ch);
+#else
             IdeAltStatus(ch);
+#endif
         }
         status = IDE_INB(ch->Cmd + IDE_REG_STATUS);
         if (result == IDE_CMD_OK && (status & IDE_STS_ERR)) result = IDE_CMD_DEVICE_ERROR;
@@ -639,7 +668,10 @@ IdeIntelSetPio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Unit, IN 
         master |= control;
         master |= ((ULONG)g_IntelTimings[Pio][0] << 12) | ((ULONG)g_IntelTimings[Pio][1] << 8);
     }
-    master |= INTEL_IDETIM_IDE;
+    /* The decode enable (bit 15) stays as the BIOS set it: a channel it turned
+       off is not used (IdePciChannelEnabled), and turning it on would make the
+       PATA function answer on ports an ICH in combined mode gave to its SATA
+       function */
     IdePciWriteConfig(HwInit, masterReg, 2, master);
 
     /* UDMA off until a UDMA mode is chosen */
@@ -700,7 +732,6 @@ IdeIntelSetDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Unit, IN 
             master |= control;
             master |= ((ULONG)g_IntelTimings[neededPio][0] << 12) | ((ULONG)g_IntelTimings[neededPio][1] << 8);
         }
-        master |= INTEL_IDETIM_IDE;
         IdePciWriteConfig(HwInit, masterReg, 2, master);
         udmaEnable &= ~(1UL << devid);
     }
@@ -1303,7 +1334,17 @@ IdeSelectTransferMode(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN ULONG
         return;
     }
 
-    cable80 = (BOOLEAN)(sata || (id[IDW_HW_RESET_RESULT] & IDW93_CABLE_80) || IdeHostCable80(HwInit, port));
+#ifdef IDE_NT31_COMPAT
+    /* On the ICH5 parallel function the BIOS cable bits in IOCFG are
+       authoritative, including for a SATA drive behind a PATA bridge.
+       IDENTIFY describes the drive side of that bridge. */
+    if (HwInit->VendorId == 0x8086 && HwInit->DeviceId == 0x24DB) {
+        cable80 = IdeIntelCable80(HwInit, port);
+    } else
+#endif
+    {
+        cable80 = (BOOLEAN)(sata || (id[IDW_HW_RESET_RESULT] & IDW93_CABLE_80) || IdeHostCable80(HwInit, port));
+    }
 
     /* Mode in effect now: set by the BIOS, together with the host timing */
     cur = IDE_NO_UDMA;
@@ -1487,6 +1528,9 @@ IdeIssueDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_B
     IdeWriteTaskFile(ch, Req, TRUE);
 
     if (Req->IsAtapi) {
+#ifdef IDE_NT31_COMPAT
+        IdePauseTaskFile(ch);
+#endif
         timeoutUsec = IdeTimeoutUsec(Srb, Req);
         if (!IdeSendPacket(ch, Req, timeoutUsec)) {
             UCHAR status = IDE_INB(ch->Cmd + IDE_REG_STATUS);
@@ -1543,7 +1587,11 @@ IdeIssuePio(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_B
     IdeWriteTaskFile(ch, Req, FALSE);
     /* BSY is valid 400 ns after the command; until then the status may
        still be the previous one, which would look like the end */
+#ifdef IDE_NT31_COMPAT
+    IdePauseTaskFile(ch);
+#else
     ScsiPortStallExecution(1);
+#endif
 
     if (Req->IsAtapi || (Req->IsWrite && ch->PioLeft != 0)) {
         if (Req->IsAtapi) {
@@ -1819,6 +1867,8 @@ IdeFailOutstanding(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN UCHAR Sr
     ch->Outstanding = NULL;
     ch->ActivePio = FALSE;
     ch->PioTail = FALSE;
+    ch->FlushAfter = FALSE;
+    ch->ChainLeft = 0;
     if (srb != NULL) {
         srb->SrbStatus = SrbStatus;
         ScsiPortNotification(RequestComplete, HwInit, srb);

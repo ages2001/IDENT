@@ -1,12 +1,14 @@
 /*
- * IDENT - IRP_MJ_PNP and IRP_MJ_DEVICE_CONTROL front ends for Windows 2000/XP
+ * IDENT - IRP_MJ_PNP start-device hook for Windows 2000/XP
  *
  * A PCI IDE function in compatibility mode raises ISA IRQ 14 and 15, which
  * the PCI bus driver does not report as its resources. ScsiPort refuses to
  * start a PCI adapter whose resource list has no interrupt, so the start
  * IRP of such a function gets IRQ 14 added on its way to ScsiPort: the raw
  * list the bus-relative number, the translated list what the HAL gives for
- * ISA IRQ 14. ScsiPort connects one interrupt for a PnP adapter; on x86
+ * ISA IRQ 14 (IRQ 15 for a function whose primary channel is off, as one
+ * of the two functions of an Intel ICH in combined mode). ScsiPort connects
+ * one interrupt for a PnP adapter; on x86
  * and x64 the driver connects IRQ 15 itself once the adapter has started
  * and runs ScsiPort's interrupt routine for it under ScsiPort's interrupt
  * lock, as ScsiPort does for the second interrupt of a non-PnP adapter
@@ -22,8 +24,6 @@
  */
 
 #include <ntddk.h>
-#include <srb.h>
-#include <ntddscsi.h>
 
 /* Not in every DDK's header for every platform; exported by every HAL */
 ULONG NTAPI HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber, ULONG BusInterruptLevel,
@@ -31,6 +31,9 @@ ULONG NTAPI HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber,
 
 /* idemain.c: the secondary channel's interrupt on or off (synchronized) */
 BOOLEAN IdeSecondaryInterrupt(IN PVOID HwInit, IN BOOLEAN On);
+/* idemain.c: the ISA IRQ of the first channel in use of a compatibility-mode function, 0 for none */
+ULONG IdePciCompatIrq(IN PVOID PciConfig);
+VOID IdeHookDeviceControl(IN PVOID DriverObject);
 
 #define IDE_PNP_POOL_TAG        ((ULONG)'I' | ((ULONG)'D' << 8) | ((ULONG)'N' << 16) | ((ULONG)'T' << 24))
 
@@ -67,10 +70,12 @@ static PVOID g_IdeStartingHwInit;
 static VOID IdeConnectSecondary(IN PDEVICE_OBJECT Device, IN PVOID HwInit);
 static VOID IdeDisconnectSecondary(IN PDEVICE_OBJECT Device);
 
-/* The primary channel's IRQ only: ScsiPort connects one interrupt for a
-   PnP adapter; IRQ 15 is connected after the start (IdeConnectSecondary) */
-#define IDE_LEGACY_IRQ_COUNT    1
-static const ULONG g_IdeLegacyIrq[IDE_LEGACY_IRQ_COUNT] = { 14 };
+/* One interrupt for ScsiPort, which connects one for a PnP adapter: the
+   primary channel's IRQ 14, or IRQ 15 when only the secondary channel is
+   in use; a secondary channel next to the primary gets IRQ 15 after the
+   start (IdeConnectSecondary) */
+#define IDE_LEGACY_IRQ_PRIMARY  14
+#define IDE_LEGACY_IRQ_SECONDARY 15
 
 /* No CRT: byte loops for the few bytes moved here */
 static VOID
@@ -160,7 +165,7 @@ IdeResourceListSize(IN PCM_RESOURCE_LIST List, OUT PULONG Count)
 
 /* A copy of the list with the legacy IRQ in place of any interrupt */
 static PCM_RESOURCE_LIST
-IdeAppendLegacyIrqs(IN PCM_RESOURCE_LIST List, IN BOOLEAN Translated)
+IdeAppendLegacyIrqs(IN PCM_RESOURCE_LIST List, IN BOOLEAN Translated, IN ULONG Irq)
 {
     PCM_RESOURCE_LIST copy;
     PCM_PARTIAL_RESOURCE_DESCRIPTOR src, d;
@@ -171,7 +176,7 @@ IdeAppendLegacyIrqs(IN PCM_RESOURCE_LIST List, IN BOOLEAN Translated)
     /* the device-specific data, if any, must stay last: appended entries
        go in front of it, so the copy is laid out again */
     copy = (PCM_RESOURCE_LIST)ExAllocatePoolWithTag(NonPagedPool,
-                size + IDE_LEGACY_IRQ_COUNT * sizeof(CM_PARTIAL_RESOURCE_DESCRIPTOR), IDE_PNP_POOL_TAG);
+                size + sizeof(CM_PARTIAL_RESOURCE_DESCRIPTOR), IDE_PNP_POOL_TAG);
     if (copy == NULL) return NULL;
     IdePnpCopy(copy, List, FIELD_OFFSET(CM_RESOURCE_LIST, List[0].PartialResourceList.PartialDescriptors));
     src = IdeDescriptors(List);
@@ -182,24 +187,22 @@ IdeAppendLegacyIrqs(IN PCM_RESOURCE_LIST List, IN BOOLEAN Translated)
         d[n++] = src[i];
     }
     count = n;
-    for (i = 0; i < IDE_LEGACY_IRQ_COUNT; i++, count++) {
-        IdePnpZero(&d[count], sizeof(d[count]));
-        d[count].Type = CmResourceTypeInterrupt;
-        d[count].ShareDisposition = CmResourceShareDeviceExclusive;
-        d[count].Flags = CM_RESOURCE_INTERRUPT_LATCHED;
-        if (Translated) {
-            KIRQL irql = 0;
-            KAFFINITY affinity = 0;
-            d[count].u.Interrupt.Vector = HalGetInterruptVector(Isa, 0, g_IdeLegacyIrq[i], g_IdeLegacyIrq[i],
-                                                                &irql, &affinity);
-            d[count].u.Interrupt.Level = irql;
-            d[count].u.Interrupt.Affinity = affinity;
-        } else {
-            d[count].u.Interrupt.Level = g_IdeLegacyIrq[i];
-            d[count].u.Interrupt.Vector = g_IdeLegacyIrq[i];
-            d[count].u.Interrupt.Affinity = (KAFFINITY)-1;
-        }
+    IdePnpZero(&d[count], sizeof(d[count]));
+    d[count].Type = CmResourceTypeInterrupt;
+    d[count].ShareDisposition = CmResourceShareDeviceExclusive;
+    d[count].Flags = CM_RESOURCE_INTERRUPT_LATCHED;
+    if (Translated) {
+        KIRQL irql = 0;
+        KAFFINITY affinity = 0;
+        d[count].u.Interrupt.Vector = HalGetInterruptVector(Isa, 0, Irq, Irq, &irql, &affinity);
+        d[count].u.Interrupt.Level = irql;
+        d[count].u.Interrupt.Affinity = affinity;
+    } else {
+        d[count].u.Interrupt.Level = Irq;
+        d[count].u.Interrupt.Vector = Irq;
+        d[count].u.Interrupt.Affinity = (KAFFINITY)-1;
     }
+    count++;
     copy->List[0].PartialResourceList.Count = count;
     return copy;
 }
@@ -216,6 +219,56 @@ IdeFreePnpLists(IN PDEVICE_OBJECT Device)
             IdePnpZero(&g_IdePnpLists[i], sizeof(g_IdePnpLists[i]));
         }
     }
+}
+
+/* The IRQ ScsiPort gets for a compatibility-mode function: found by its
+   bus-master block (BAR 4, the 16-byte port range of the list) on the
+   list's bus; IRQ 14 when it is not found or uses no legacy channel */
+static ULONG
+IdeCompatStartIrq(IN PCM_RESOURCE_LIST Raw)
+{
+    PCM_PARTIAL_RESOURCE_DESCRIPTOR d;
+    PCI_SLOT_NUMBER slot;
+    PCI_COMMON_CONFIG cfg;
+    ULONG i, n = IdeDescriptorCount(Raw), bm = 0, bus, device, function, irq;
+    BOOLEAN multiFunction;
+
+    if (n == 0 || Raw->List[0].InterfaceType != PCIBus) return IDE_LEGACY_IRQ_PRIMARY;
+    d = IdeDescriptors(Raw);
+    for (i = 0; i < n; i++) {
+        if (d[i].Type == CmResourceTypeDeviceSpecific) break;
+        if (d[i].Type == CmResourceTypePort && d[i].u.Port.Length == 16) {
+            bm = (ULONG)d[i].u.Port.Start.QuadPart;
+            break;
+        }
+    }
+    if (bm == 0 || bm > 0xFFFF) return IDE_LEGACY_IRQ_PRIMARY;
+    bus = Raw->List[0].BusNumber;
+    for (device = 0; device < 32; device++) {
+        multiFunction = FALSE;
+        for (function = 0; function < 8; function++) {
+            if (function > 0 && !multiFunction) break;
+            slot.u.AsULONG = 0;
+            slot.u.bits.DeviceNumber = device;
+            slot.u.bits.FunctionNumber = function;
+            IdePnpZero(&cfg, sizeof(cfg));
+            /* the header and the chip registers up to 9Fh (the channel
+               enables and the ICH's MAP at 90h) */
+            if (HalGetBusDataByOffset(PCIConfiguration, bus, slot.u.AsULONG, &cfg, 0, 0xA0) < 0xA0 ||
+                cfg.VendorID == 0xFFFF || cfg.VendorID == 0) {
+                if (function == 0) break;
+                continue;
+            }
+            if (function == 0) multiFunction = (BOOLEAN)((cfg.HeaderType & 0x80) != 0);
+            if (cfg.BaseClass != 0x01 || (cfg.HeaderType & 0x7F) != 0) continue;
+            if (!(cfg.u.type0.BaseAddresses[4] & 1) || (cfg.u.type0.BaseAddresses[4] & ~3UL) != bm) continue;
+            irq = IdePciCompatIrq(&cfg);
+            DbgPrint("[IDENT] PnP start: bus %lu slot %08lX, first legacy channel in use: IRQ %lu\n",
+                     bus, slot.u.AsULONG, irq);
+            return irq == IDE_LEGACY_IRQ_SECONDARY ? IDE_LEGACY_IRQ_SECONDARY : IDE_LEGACY_IRQ_PRIMARY;
+        }
+    }
+    return IDE_LEGACY_IRQ_PRIMARY;
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,6 +406,75 @@ IdeFilterRequirements(IN PIO_RESOURCE_REQUIREMENTS_LIST Req)
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Windows Vista and later                                             */
+/* ------------------------------------------------------------------ */
+
+/* Vista and later: the HAL no longer translates an ISA IRQ through
+   HalGetInterruptVector (it gives vector 0), so the start IRP cannot be
+   given IRQ 14/15 that way. A compatibility-mode function asks the PnP
+   manager for its legacy IRQ in its resource requirements instead; the
+   arbiter puts it, raw and translated, into the start IRP. The secondary
+   channel of such a function runs in Fast Polling there. */
+static BOOLEAN g_IdeNt6;
+
+static PIO_RESOURCE_REQUIREMENTS_LIST
+IdeRequireLegacyIrq(IN PIO_RESOURCE_REQUIREMENTS_LIST Req)
+{
+    PCI_COMMON_CONFIG cfg;
+    PIO_RESOURCE_REQUIREMENTS_LIST copy;
+    PUCHAR src, dst;
+    ULONG a, i, irq, size;
+
+    if (Req == NULL || Req->InterfaceType != PCIBus || Req->AlternativeLists == 0) return NULL;
+    IdePnpZero(&cfg, sizeof(cfg));
+    if (HalGetBusDataByOffset(PCIConfiguration, Req->BusNumber, Req->SlotNumber, &cfg, 0, 0xA0) < 0xA0 ||
+        cfg.BaseClass != 0x01 || (cfg.HeaderType & 0x7F) != 0) {
+        return NULL;
+    }
+    irq = IdePciCompatIrq(&cfg);
+    if (irq == 0) return NULL;
+    /* nothing to do when an interrupt is asked for already */
+    src = (PUCHAR)Req + FIELD_OFFSET(IO_RESOURCE_REQUIREMENTS_LIST, List);
+    for (a = 0; a < Req->AlternativeLists; a++) {
+        PIO_RESOURCE_LIST list = (PIO_RESOURCE_LIST)src;
+        PIO_RESOURCE_DESCRIPTOR d = (PIO_RESOURCE_DESCRIPTOR)(src + FIELD_OFFSET(IO_RESOURCE_LIST, Descriptors));
+        for (i = 0; i < list->Count; i++) {
+            if (d[i].Type == CmResourceTypeInterrupt) return NULL;
+        }
+        src = (PUCHAR)&d[list->Count];
+    }
+    size = Req->ListSize + Req->AlternativeLists * sizeof(IO_RESOURCE_DESCRIPTOR);
+    copy = (PIO_RESOURCE_REQUIREMENTS_LIST)ExAllocatePoolWithTag(PagedPool, size, IDE_PNP_POOL_TAG);
+    if (copy == NULL) return NULL;
+    IdePnpCopy(copy, Req, FIELD_OFFSET(IO_RESOURCE_REQUIREMENTS_LIST, List));
+    copy->ListSize = size;
+    src = (PUCHAR)Req + FIELD_OFFSET(IO_RESOURCE_REQUIREMENTS_LIST, List);
+    dst = (PUCHAR)copy + FIELD_OFFSET(IO_RESOURCE_REQUIREMENTS_LIST, List);
+    for (a = 0; a < Req->AlternativeLists; a++) {
+        PIO_RESOURCE_LIST list = (PIO_RESOURCE_LIST)src;
+        PIO_RESOURCE_LIST out = (PIO_RESOURCE_LIST)dst;
+        ULONG bytes = FIELD_OFFSET(IO_RESOURCE_LIST, Descriptors) + list->Count * sizeof(IO_RESOURCE_DESCRIPTOR);
+        PIO_RESOURCE_DESCRIPTOR d;
+        IdePnpCopy(out, list, bytes);
+        d = (PIO_RESOURCE_DESCRIPTOR)(dst + bytes);
+        IdePnpZero(d, sizeof(*d));
+        d->Option = 0;
+        d->Type = CmResourceTypeInterrupt;
+        d->ShareDisposition = CmResourceShareShared;
+        d->Flags = CM_RESOURCE_INTERRUPT_LATCHED;
+        d->u.Interrupt.MinimumVector = irq;
+        d->u.Interrupt.MaximumVector = irq;
+        out->Count = list->Count + 1;
+        src += bytes;
+        dst += bytes + sizeof(IO_RESOURCE_DESCRIPTOR);
+    }
+    DbgPrint("[IDENT] PnP requirements: bus %lu slot %08lX, compatibility mode: IRQ %lu asked for\n",
+             Req->BusNumber, Req->SlotNumber, irq);
+    return copy;
+}
+
 static NTSTATUS NTAPI
 IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
 {
@@ -365,6 +487,14 @@ IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
         PIO_RESOURCE_REQUIREMENTS_LIST req = (PIO_RESOURCE_REQUIREMENTS_LIST)Irp->IoStatus.Information;
         if (req == NULL) req = stack->Parameters.FilterResourceRequirements.IoResourceRequirementList;
         IdeFilterRequirements(req);
+        if (g_IdeNt6) {
+            PIO_RESOURCE_REQUIREMENTS_LIST more = IdeRequireLegacyIrq(req);
+            if (more != NULL) {
+                if ((PIO_RESOURCE_REQUIREMENTS_LIST)Irp->IoStatus.Information == req) ExFreePool(req);
+                Irp->IoStatus.Information = (ULONG_PTR)more;
+                Irp->IoStatus.Status = STATUS_SUCCESS;
+            }
+        }
     }
 
     if (stack->MinorFunction == IRP_MN_START_DEVICE) {
@@ -380,11 +510,17 @@ IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
            a bus master or other BAR, and a PCI interrupt if the BIOS gave
            it one, which the channels do not raise. A native-mode function
            has BAR 0-3 and is passed on as the PCI bus driver set it up. */
-        if (raw != NULL && translated != NULL && IdeCommandBlockCount(raw) == 0) {
-            IdeQuietNativeOnLegacyPorts();
-            PCM_RESOURCE_LIST newRaw = IdeAppendLegacyIrqs(raw, FALSE);
-            PCM_RESOURCE_LIST newTranslated = IdeAppendLegacyIrqs(translated, TRUE);
+        if (raw != NULL && translated != NULL && IdeCommandBlockCount(raw) == 0 && g_IdeNt6) {
+            /* Vista and later: the IRQ came through the requirements (or not at all) */
+            DbgPrint("[IDENT] PnP start: compatibility mode, %lu interrupt(s) assigned\n", IdeResourceListCount(raw, CmResourceTypeInterrupt));
+        } else if (raw != NULL && translated != NULL && IdeCommandBlockCount(raw) == 0) {
+            ULONG irq = IdeCompatStartIrq(raw);
+            PCM_RESOURCE_LIST newRaw, newTranslated;
             ULONG i;
+
+            IdeQuietNativeOnLegacyPorts();
+            newRaw = IdeAppendLegacyIrqs(raw, FALSE, irq);
+            newTranslated = IdeAppendLegacyIrqs(translated, TRUE, irq);
 
             if (newRaw != NULL && newTranslated != NULL) {
                 PCM_PARTIAL_RESOURCE_DESCRIPTOR added;
@@ -401,8 +537,8 @@ IdePnpDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
                 stack->Parameters.StartDevice.AllocatedResources = newRaw;
                 stack->Parameters.StartDevice.AllocatedResourcesTranslated = newTranslated;
                 added = &IdeDescriptors(newTranslated)[IdeDescriptorCount(newTranslated) - 1];
-                DbgPrint("[IDENT] PnP start: compatibility mode, IRQ 14 connected (vector %lX, IRQL %lu)\n",
-                         added->u.Interrupt.Vector, added->u.Interrupt.Level);
+                DbgPrint("[IDENT] PnP start: compatibility mode, IRQ %lu connected (vector %lX, IRQL %lu)\n",
+                         irq, added->u.Interrupt.Vector, added->u.Interrupt.Level);
                 compatStart = TRUE;
             } else {
                 if (newRaw != NULL) ExFreePool(newRaw);
@@ -655,121 +791,6 @@ IdeDisconnectSecondary(IN PDEVICE_OBJECT Device)
 }
 #endif
 
-/* ------------------------------------------------------------------ */
-/* IOCTL_SCSI_MINIPORT sent to a disk's PDO                            */
-/* ------------------------------------------------------------------ */
-
-/* disk.sys sends its SMART requests (SMART_GET_VERSION, SMART_RCV_DRIVE_DATA,
-   SMART_SEND_DRIVE_COMMAND and its own failure prediction) as
-   IOCTL_SCSI_MINIPORT to the disk's PDO. ScsiPort of Server 2003 / XP x64
-   answers that IOCTL on a PDO with STATUS_INVALID_DEVICE_REQUEST (only the
-   adapter's device object takes it). The front end turns it into the
-   SRB_FUNCTION_IO_CONTROL request ScsiPort builds for the adapter, sent
-   through the PDO, which puts the disk's address into it. Same on every
-   2000/XP version: the miniport sees the request as before. */
-static PDRIVER_DISPATCH g_IdeOrigDeviceControl;
-
-static NTSTATUS NTAPI
-IdePdoIoctlDone(IN PDEVICE_OBJECT Device, IN PIRP Irp, IN PVOID Context)
-{
-    (VOID)Device;
-    (VOID)Irp;
-    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
-    return STATUS_MORE_PROCESSING_REQUIRED;
-}
-
-static NTSTATUS
-IdePdoMiniportIoctl(IN PDEVICE_OBJECT Device, IN PIRP Irp)
-{
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp), next;
-    PSRB_IO_CONTROL ctl = (PSRB_IO_CONTROL)Irp->AssociatedIrp.SystemBuffer;
-    ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
-    PSCSI_REQUEST_BLOCK srb;
-    ULONG length;
-    KEVENT event;
-    PMDL mdl;
-    NTSTATUS status;
-    PIRP irp;
-
-    if (ctl == NULL || inLen < sizeof(SRB_IO_CONTROL)) {
-        status = STATUS_INVALID_PARAMETER;
-        goto done;
-    }
-    if (ctl->HeaderLength != sizeof(SRB_IO_CONTROL)) {
-        status = STATUS_REVISION_MISMATCH;
-        goto done;
-    }
-    length = ctl->HeaderLength + ctl->Length;
-    if (length < ctl->Length) {
-        status = STATUS_INVALID_PARAMETER;
-        goto done;
-    }
-    if (inLen < length && outLen < length) {
-        status = STATUS_BUFFER_TOO_SMALL;
-        goto done;
-    }
-    srb = (PSCSI_REQUEST_BLOCK)ExAllocatePoolWithTag(NonPagedPool, sizeof(SCSI_REQUEST_BLOCK), IDE_PNP_POOL_TAG);
-    irp = IoAllocateIrp(Device->StackSize, FALSE);
-    /* ScsiPort maps the data of a request through the IRP's MDL: one for
-       the buffered IOCTL's system buffer (nonpaged pool) */
-    mdl = (irp != NULL) ? IoAllocateMdl(ctl, length, FALSE, FALSE, irp) : NULL;
-    if (srb == NULL || irp == NULL || mdl == NULL) {
-        if (srb != NULL) ExFreePool(srb);
-        if (mdl != NULL) IoFreeMdl(mdl);
-        if (irp != NULL) { irp->MdlAddress = NULL; IoFreeIrp(irp); }
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto done;
-    }
-    MmBuildMdlForNonPagedPool(mdl);
-    IdePnpZero(srb, sizeof(*srb));
-    srb->Length = sizeof(SCSI_REQUEST_BLOCK);
-    srb->Function = SRB_FUNCTION_IO_CONTROL;
-    srb->SrbFlags = SRB_FLAGS_DATA_IN | SRB_FLAGS_DATA_OUT | SRB_FLAGS_NO_QUEUE_FREEZE;
-    srb->DataBuffer = ctl;
-    srb->DataTransferLength = length;
-    srb->TimeOutValue = ctl->Timeout;
-    srb->OriginalRequest = irp;
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
-    next = IoGetNextIrpStackLocation(irp);
-    next->MajorFunction = IRP_MJ_SCSI;
-    next->Parameters.Scsi.Srb = srb;
-    IoSetCompletionRoutine(irp, IdePdoIoctlDone, &event, TRUE, TRUE, TRUE);
-    if (IoCallDriver(Device, irp) == STATUS_PENDING) {
-        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-    }
-    status = irp->IoStatus.Status;
-    irp->MdlAddress = NULL;
-    IoFreeMdl(mdl);
-    IoFreeIrp(irp);
-    ExFreePool(srb);
-    Irp->IoStatus.Information = length < outLen ? length : outLen;
-    Irp->IoStatus.Status = status;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return status;
-
-done:
-    Irp->IoStatus.Information = 0;
-    Irp->IoStatus.Status = status;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return status;
-}
-
-/* ScsiPort creates the adapter's device object as FILE_DEVICE_CONTROLLER,
-   its PDOs with the type of the device (disk, CD-ROM, mass storage) */
-static NTSTATUS NTAPI
-IdeDeviceControlDispatch(IN PDEVICE_OBJECT Device, IN PIRP Irp)
-{
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-
-    if (Device->DeviceType != FILE_DEVICE_CONTROLLER &&
-        stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_SCSI_MINIPORT &&
-        KeGetCurrentIrql() == PASSIVE_LEVEL) {
-        return IdePdoMiniportIoctl(Device, Irp);
-    }
-    return g_IdeOrigDeviceControl(Device, Irp);
-}
-
 /* After ScsiPortInitialize: ScsiPort's IRP_MJ_PNP and IRP_MJ_DEVICE_CONTROL
    entries get a front end */
 VOID
@@ -778,11 +799,12 @@ IdeHookPnp(IN PVOID DriverObject)
     PDRIVER_OBJECT driver = (PDRIVER_OBJECT)DriverObject;
 
     if (driver == NULL) return;
-    if (driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] != NULL &&
-        driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] != IdeDeviceControlDispatch) {
-        g_IdeOrigDeviceControl = driver->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-        driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IdeDeviceControlDispatch;
+    {
+        ULONG major = 0, minor = 0;
+        PsGetVersion(&major, &minor, NULL, NULL);
+        g_IdeNt6 = (BOOLEAN)(major >= 6);
     }
+    IdeHookDeviceControl(DriverObject);           /* idepdo.c */
     if (driver->MajorFunction[IRP_MJ_PNP] == NULL ||
         driver->MajorFunction[IRP_MJ_PNP] == IdePnpDispatch) {
         return;

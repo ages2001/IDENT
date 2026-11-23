@@ -1,0 +1,257 @@
+--- a/hw/ide/piix.c
++++ b/hw/ide/piix.c
+@@ -34,6 +34,9 @@
+ #include "hw/ide/pci.h"
+ #include "ide-internal.h"
+ #include "trace.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "qemu/timer.h"
+ 
+ static uint64_t bmdma_read(void *opaque, hwaddr addr, unsigned size)
+ {
+@@ -223,6 +226,244 @@
+     .class_init    = piix4_ide_class_init,
+ };
+ 
++/* ICH5 Enhanced Mode PCI IDE functions for IDENT regression tests. */
++
++typedef struct Ich5Test {
++    PCIIDEState parent;
++    MemoryRegion compat_control[2];
++    bool native;
++    bool irq[2];
++    bool srst[2];
++    uint32_t settle_ms;
++    uint32_t status_delay_ns;
++    bool aimb_resources;
++    bool cable80;
++    uint8_t prev_status[2];
++    int64_t status_valid_at[2];
++    int64_t ready_at[2];
++} Ich5Test;
++
++static Ich5Test *ich5_controller(IDEBus *bus)
++{
++    return (Ich5Test *)BUS(bus)->parent;
++}
++
++static bool ich5_settling(IDEBus *bus)
++{
++    return qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) <
++           ich5_controller(bus)->ready_at[bus->bus_id];
++}
++
++static bool ich5_stale_status(IDEBus *bus)
++{
++    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
++           ich5_controller(bus)->status_valid_at[bus->bus_id];
++}
++
++static uint64_t ich5_data_read(void *opaque, hwaddr addr, unsigned size)
++{
++    if (ich5_settling(opaque)) {
++        return UINT64_MAX;
++    }
++    IDEBus *bus = opaque;
++    if (addr == 7 && size == 1 && ich5_stale_status(bus)) {
++        /* Retain the normal IRQ acknowledge side effect. */
++        pci_ide_data_le_ops.read(bus, addr, size);
++        return ich5_controller(bus)->prev_status[bus->bus_id];
++    }
++    return pci_ide_data_le_ops.read(bus, addr, size);
++}
++
++static void ich5_data_write(void *opaque, hwaddr addr, uint64_t val,
++                            unsigned size)
++{
++    if (!ich5_settling(opaque)) {
++        IDEBus *bus = opaque;
++        Ich5Test *s = ich5_controller(bus);
++        if (addr == 7 && size == 1 && s->status_delay_ns) {
++            s->prev_status[bus->bus_id] = ide_status_read(bus, 0);
++            s->status_valid_at[bus->bus_id] =
++                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->status_delay_ns;
++        }
++        pci_ide_data_le_ops.write(bus, addr, val, size);
++    }
++}
++
++static uint64_t ich5_control_read(void *opaque, hwaddr addr, unsigned size)
++{
++    if (ich5_settling(opaque)) {
++        return UINT64_MAX;
++    }
++    IDEBus *bus = opaque;
++    if (addr == 2 && size == 1 && ich5_stale_status(bus)) {
++        return ich5_controller(bus)->prev_status[bus->bus_id];
++    }
++    return pci_ide_cmd_le_ops.read(bus, addr, size);
++}
++
++static void ich5_control_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned size)
++{
++    IDEBus *bus = opaque;
++    Ich5Test *s = ich5_controller(bus);
++    int i = bus->bus_id;
++
++    if (addr == 2 && size == 1) {
++        if (s->srst[i] && !(val & IDE_CTRL_RESET)) {
++            s->ready_at[i] = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                             s->settle_ms;
++        }
++        s->srst[i] = (val & IDE_CTRL_RESET) != 0;
++    }
++    pci_ide_cmd_le_ops.write(bus, addr, val, size);
++}
++
++static const MemoryRegionOps ich5_data_ops = {
++    .read = ich5_data_read, .write = ich5_data_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static const MemoryRegionOps ich5_control_ops = {
++    .read = ich5_control_read, .write = ich5_control_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void ich5_irq(void *opaque, int i, int level)
++{
++    Ich5Test *s = opaque;
++
++    s->irq[i] = level;
++    pci_set_irq(PCI_DEVICE(s), s->irq[0] || s->irq[1]);
++}
++
++static void ich5_decode(PCIDevice *dev)
++{
++    PCIIDEState *d = PCI_IDE(dev);
++
++    for (int i = 0; i < 2; ++i) {
++        bool enabled = (dev->config[PCI_COMMAND] & PCI_COMMAND_IO) &&
++                       (dev->config[0x41 + 2 * i] & 0x80);
++        memory_region_set_enabled(&d->data_bar[i], enabled);
++        memory_region_set_enabled(&d->cmd_bar[i], enabled);
++    }
++}
++
++static void ich5_config_write(PCIDevice *dev, uint32_t addr,
++                              uint32_t val, int len)
++{
++    /* SeaBIOS writes legacy task-file addresses to all PCI IDE functions.
++     * Supply distinct native windows, as an Enhanced Mode BIOS would. */
++    if (((Ich5Test *)dev)->native && len == 4 &&
++        addr >= PCI_BASE_ADDRESS_0 && addr <= PCI_BASE_ADDRESS_3) {
++        static const unsigned legacy[4] = { 0x1f0, 0x3f4, 0x170, 0x374 };
++        unsigned bar = (addr - PCI_BASE_ADDRESS_0) / 4;
++        if ((val & ~3U) == legacy[bar]) {
++            val = 0xc100 + bar * 8 + PCI_BASE_ADDRESS_SPACE_IO;
++        }
++    }
++    /* Optional firmware placement from the AIMB-865 boot trace. Keep
++     * BAR sizing probes intact. */
++    Ich5Test *s = (Ich5Test *)dev;
++    if (s->aimb_resources && !s->native && addr == PCI_BASE_ADDRESS_4 &&
++        len == 4 && (val & ~15U) && (val & ~15U) != 0xfffffff0U) {
++        val = 0xfc01;
++    }
++    pci_default_write_config(dev, addr, val, len);
++    ich5_decode(dev);
++}
++
++static void ich5_reset(DeviceState *dev)
++{
++    PCIIDEState *d = PCI_IDE(dev);
++    Ich5Test *s = (Ich5Test *)dev;
++    PCIDevice *pd = PCI_DEVICE(dev);
++
++    for (int i = 0; i < 2; ++i) {
++        ide_bus_reset(&d->bus[i]);
++        s->ready_at[i] = s->status_valid_at[i] = 0;
++        s->srst[i] = s->irq[i] = false;
++        pd->config[0x41 + 2 * i] = s->aimb_resources ? 0xe3 : 0x80;
++    }
++    if (s->native) {
++        /* Enhanced MAP 0: port 0 and port 1 are masters on separate channels. */
++        pd->config[0x90] = 0;
++        pd->config[0x92] = 3 | (d->bus[0].ifs[0].blk ? 0x10 : 0) |
++                               (d->bus[1].ifs[0].blk ? 0x20 : 0);
++    }
++    /* Post-firmware profile: SeaBIOS probes the legacy ports at startup. */
++    pci_set_word(pd->config + PCI_COMMAND, PCI_COMMAND_IO);
++    ich5_decode(pd);
++}
++
++static void ich5_realize(PCIDevice *dev, Error **errp)
++{
++    PCIIDEState *d = PCI_IDE(dev);
++    Ich5Test *s = (Ich5Test *)dev;
++    MemoryRegion *io = pci_address_space_io(dev);
++
++    s->native = pci_get_word(dev->config + PCI_DEVICE_ID) == 0x24d1;
++    dev->config[PCI_CLASS_PROG] = s->native ? 0x8f : 0x8a;
++    dev->config[PCI_INTERRUPT_PIN] = s->native ? 1 : 0;
++    dev->config[0x54] = s->cable80 ? (s->aimb_resources ? 0x30 : 0xf0) : 0;
++    bmdma_setup_bar(d);
++    pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &d->bmdma_bar);
++    for (int i = 0; i < 2; ++i) {
++        IDEBus *bus = &d->bus[i];
++        ide_bus_init(bus, sizeof(*bus), DEVICE(dev), i, s->native ? 1 : 2);
++        ide_bus_init_output_irq(bus, s->native ? qemu_allocate_irq(ich5_irq, s, i)
++                                               : isa_get_irq(NULL, 14 + i));
++        bmdma_init(bus, &d->bmdma[i], d);
++        ide_bus_register_restart_cb(bus);
++        memory_region_init_io(&d->data_bar[i], OBJECT(d), &ich5_data_ops,
++                              bus, "ich5-taskfile", 8);
++        memory_region_init_io(&d->cmd_bar[i], OBJECT(d), &ich5_control_ops,
++                              bus, "ich5-control", 4);
++        if (s->native) {
++            pci_register_bar(dev, 2 * i, PCI_BASE_ADDRESS_SPACE_IO, &d->data_bar[i]);
++            pci_register_bar(dev, 2 * i + 1, PCI_BASE_ADDRESS_SPACE_IO, &d->cmd_bar[i]);
++        } else {
++            memory_region_add_subregion(io, i ? 0x170 : 0x1f0, &d->data_bar[i]);
++            /* Map only the control port; 3f7h is shared with the FDC. */
++            MemoryRegion *ctl = &s->compat_control[i];
++            memory_region_init_alias(ctl, OBJECT(d), "ich5-altstatus",
++                                     &d->cmd_bar[i], 2, 1);
++            memory_region_add_subregion(io, i ? 0x376 : 0x3f6, ctl);
++        }
++    }
++}
++
++static const Property ich5_props[] = {
++    DEFINE_PROP_UINT32("post-command-status-ns", Ich5Test, status_delay_ns, 0),
++    DEFINE_PROP_BOOL("aimb-resources", Ich5Test, aimb_resources, false),
++    DEFINE_PROP_BOOL("cable80", Ich5Test, cable80, true),
++    DEFINE_PROP_UINT32("post-srst-float-ms", Ich5Test, settle_ms, 0),
++};
++
++static void ich5_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
++    pc->vendor_id = PCI_VENDOR_ID_INTEL;
++    pc->device_id = (uintptr_t)data;
++    pc->class_id = PCI_CLASS_STORAGE_IDE;
++    pc->revision = 2;
++    pc->realize = ich5_realize;
++    pc->config_write = ich5_config_write;
++    dc->hotpluggable = false;
++    device_class_set_legacy_reset(dc, ich5_reset);
++    device_class_set_props(dc, ich5_props);
++}
++
++static const TypeInfo ich5_types[] = {
++    { .name = "ich5-pata-test", .parent = TYPE_PCI_IDE,
++      .instance_size = sizeof(Ich5Test), .class_init = ich5_class_init,
++      .class_data = (void *)0x24db },
++    { .name = "ich5-sata-test", .parent = TYPE_PCI_IDE,
++      .instance_size = sizeof(Ich5Test), .class_init = ich5_class_init,
++      .class_data = (void *)0x24d1 },
++};
++DEFINE_TYPES(ich5_types)
++
+ static void piix_ide_register_types(void)
+ {
+     type_register_static(&piix3_ide_info);

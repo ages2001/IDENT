@@ -59,7 +59,7 @@
 #define IDE_DRIVER_NAME         "IDENT"
 #endif
 
-#define IDE_DRIVER_VERSION      0x01020000  /* 1.2.0.0 */
+#define IDE_DRIVER_VERSION      0x01030000  /* 1.3 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -75,7 +75,12 @@ VOID __cdecl IdeDbgPrint(PCHAR Format, ...);
 #define IDE_DBG(args)           IdeDbgPrint args
 #else
 ULONG __cdecl DbgPrint(PCH Format, ...);
+#if defined(IDE_BOOT_TRACE) && defined(IDE_NT31_COMPAT)
+VOID __cdecl IdeTraceBoot(PCHAR Format, ...);
+#define IDE_DBG(args)           IdeTraceBoot args
+#else
 #define IDE_DBG(args)           DbgPrint args
+#endif
 #endif
 #else
 #define IDE_DBG(args)
@@ -138,14 +143,23 @@ typedef ULONG IDE_PORTADDR;
 #define IDE_DEVICES_PER_CHANNEL         2
 #define IDE_MAX_TARGETS                 (IDE_MAX_CHANNELS * IDE_DEVICES_PER_CHANNEL)
 #define IDE_MAX_CONTROLLERS             32
+#if defined(IDE_W9X)
 #define IDE_MAX_TRANSFER                0x20000     /* 128 KB */
+#else
+#define IDE_MAX_TRANSFER                0x80000     /* 512 KB; pieces of 256 sectors without 48-bit LBA */
+#endif
 #define IDE_SECTOR_SIZE                 512
 #define IDE_MAX_SECTOR_SIZE             4096
 
-/* An unaligned 128 KB buffer spans 33 pages; one PRD per page */
-#define IDE_MAX_PHYS_BREAKS             32
+/* An unaligned buffer of the largest transfer spans one page more than
+   it holds; one PRD per page */
+#define IDE_MAX_PHYS_BREAKS             (IDE_MAX_TRANSFER / 4096)
+#if defined(IDE_W9X)
 #define IDE_PRD_ENTRIES                 64
-#define IDE_PRD_TABLE_SIZE              (IDE_PRD_ENTRIES * 8)  /* 512, never crosses 64 KB */
+#else
+#define IDE_PRD_ENTRIES                 256
+#endif
+#define IDE_PRD_TABLE_SIZE              (IDE_PRD_ENTRIES * 8)  /* 512 / 2048, aligned to its size: never crosses 64 KB */
 
 /* Per-channel driver-owned buffer: IDENTIFY data, ATAPI REQUEST SENSE /
    MODE SENSE, the odd last word of an ATAPI PIO transfer */
@@ -543,7 +557,26 @@ typedef struct _IDE_SRB_IO_CONTROL {
 #define IDE_IOCTL_POWER_UP              0x00000011  /* set the channels up again */
 #define IDE_IOCTL_TRIM_MODE_ON          0x00000020  /* 4 KB pattern after the header */
 #define IDE_IOCTL_TRIM_MODE_OFF         0x00000021
+#define IDE_IOCTL_TRIM_STATUS           0x00000022  /* IDE_TRIM_STATUS after the header */
 #define IDE_TRIM_PATTERN_SIZE           4096
+
+/* TRIM_STATUS: in the address of a disk, out whether its pattern writes
+   become TRIMs and the adapter's byte counts since TRIM_MODE_ON */
+typedef struct _IDE_TRIM_STATUS {
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR Flags;                        /* IDE_TRIM_STATUS_xxx */
+    ULONG BlockSize;                    /* bytes per logical block of the disk */
+    ULONG TrimmedLow;                   /* pattern writes trimmed */
+    ULONG TrimmedHigh;
+    ULONG WrittenLow;                   /* pattern writes the medium got as data */
+    ULONG WrittenHigh;
+} IDE_TRIM_STATUS, *PIDE_TRIM_STATUS;
+
+#define IDE_TRIM_STATUS_PRESENT         0x01        /* a disk at that address */
+#define IDE_TRIM_STATUS_CAN_TRIM        0x02        /* its pattern writes become TRIMs */
+#define IDE_TRIM_STATUS_MODE_ON         0x04
 
 #define IDE_INFO_ASYNC                  0x00000001  /* DMA completions by interrupt */
 #define IDE_INFO_POWERED_DOWN           0x00000002
@@ -570,7 +603,10 @@ typedef struct _IDE_IOCTL_INFO {
     UCHAR  Mode[IDE_MAX_TARGETS];       /* IDE_INFO_MODE_xxx */
     UCHAR  DmaErrors[IDE_MAX_TARGETS];
     ULONG  InterruptCount;
+    /* 1.3, when the buffer has room for it */
+    ULONG  NestedInterrupts;            /* interrupts that came into a running routine of the driver */
 } IDE_IOCTL_INFO, *PIDE_IOCTL_INFO;
+#define IDE_IOCTL_INFO_SIZE_V1          ((ULONG)FIELD_OFFSET(IDE_IOCTL_INFO, NestedInterrupts))
 
 /* "SCSIDISK": SMART, as IOCTL_SCSI_MINIPORT_SMART_xxx (NTDDSCSI.H) */
 #define IDE_SMART_SIGNATURE             "SCSIDISK"
@@ -743,6 +779,14 @@ typedef struct _IDE_CHANNEL {
     UCHAR                   QueueHead;
     UCHAR                   QueueCount;
     UCHAR                   LuBlocked;      /* bit per unit: NextLuRequest owed */
+    BOOLEAN                 FlushAfter;     /* the write in flight is FUA: FLUSH CACHE follows it */
+    /* A request larger than one command takes (256 sectors without 48-bit
+       LBA, a drive's own limit) goes in pieces, the next started from the
+       completion of the one before */
+    BOOLEAN                 ChainWrite;
+    ULONG                   ChainLeft;      /* blocks after the piece in flight */
+    IDE_LBA                 ChainLba;
+    PUCHAR                  ChainData;
     UCHAR                   SelectedUnit;   /* unit in the Device register, 0xFF unknown */
 
     /* Hot plug, per unit: checks in a row with the device gone (present)
@@ -892,6 +936,11 @@ typedef struct _HW_DEVICE_EXTENSION {
     BOOLEAN                 Sector4K;       /* 4K=1: disks of 2 TB and more as 4096-byte blocks */
     BOOLEAN                 StandbyAtShutdown; /* STANDBY=1: spin down on SRB_FUNCTION_SHUTDOWN */
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
+    UCHAR                   InMiniport;     /* in HwStartIo, HwInterrupt, HwTimer or HwResetBus */
+    BOOLEAN                 Recheck;        /* an interrupt came into one of them: channels to look at */
+    ULONG                   NestedInterrupts;
+    ULONG                   TrimmedBytes[2];    /* since TRIM_MODE_ON: low, high */
+    ULONG                   TrimWrittenBytes[2];
     UCHAR                   TrimPattern[IDE_TRIM_PATTERN_SIZE];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
@@ -952,6 +1001,8 @@ static __inline void CopyMemoryBytes(PVOID dst, PVOID src, ULONG len) {
 #define IDE_UNIT_OF_TARGET(target)          ((target) % IDE_DEVICES_PER_CHANNEL)
 #define IDE_DEVICE_OF_TARGET(hw, target)    (&IDE_CHANNEL_OF_TARGET(hw, target)->Devices[IDE_UNIT_OF_TARGET(target)])
 #define IDE_TARGET_OF(ch, unit)             ((ch) * IDE_DEVICES_PER_CHANNEL + (unit))
+/* TRIM mode turns this disk's pattern writes into DATA SET MANAGEMENT TRIM */
+#define IDE_CAN_TRIM(hw, dev)               ((dev)->Trim && (dev)->UseDma && (hw)->TrimAllowed)
 
 /* ------------------------------------------------------------------ */
 /* Cross-file prototypes                                               */

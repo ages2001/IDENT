@@ -965,13 +965,79 @@ IdeRunReadWrite(
     return result;
 }
 
-/* TRIM mode: the write's data is the pattern, repeated from the first byte */
+/* Blocks one read or write command can take on the device */
+static ULONG
+IdePieceBlocks(IN PIDE_DEVICE Dev)
+{
+    ULONG sectors = Dev->Lba48 ? ATA_LBA48_MAX_SECTORS : ATA_LBA28_MAX_SECTORS;
+
+    if (Dev->MaxSectors != 0 && Dev->MaxSectors < sectors) sectors = Dev->MaxSectors;
+    sectors >>= Dev->LbaShift;
+    return sectors ? sectors : 1;
+}
+
+/* The next piece of the request in ChainData/ChainLba/ChainLeft, by
+   interrupt: SRB_STATUS_PENDING, or the status to complete the request
+   with (SRB_STATUS_INVALID_REQUEST: the rest polled) */
+static UCHAR
+IdeIssuePiece(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PIDE_DEVICE Dev, IN ULONG Unit)
+{
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
+    ULONG chunk = IdePieceBlocks(Dev);
+    ATA_REQUEST req;
+    BOOLEAN fua = FALSE;
+    UCHAR status;
+
+    if (chunk > ch->ChainLeft) chunk = ch->ChainLeft;
+    if (!IdeBuildReadWrite(Dev, Unit, ch->ChainData, ch->ChainLba, chunk, ch->ChainWrite, TRUE, &fua, &req)) {
+        return SRB_STATUS_INVALID_REQUEST;
+    }
+    status = req.UseDma ? IdeIssueDma(HwInit, Channel, Srb, &req) : IdeIssuePio(HwInit, Channel, Srb, &req);
+    if (status == SRB_STATUS_PENDING) {
+        ch->ChainLeft -= chunk;
+        IdeLbaAdd(&ch->ChainLba, chunk);
+        ch->ChainData += chunk * Dev->SectorSize;
+    }
+    return status;
+}
+
+/* Count blocks in pieces one command each, polled */
+static ULONG
+IdeRunPieces(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN PIDE_DEVICE Dev,
+             IN ULONG Unit, IN PUCHAR Data, IN IDE_LBA Lba, IN ULONG Count, IN BOOLEAN IsWrite)
+{
+    ULONG chunk, result = IDE_CMD_OK;
+    BOOLEAN noFua;
+
+    while (Count > 0 && result == IDE_CMD_OK) {
+        chunk = IdePieceBlocks(Dev);
+        if (chunk > Count) chunk = Count;
+        noFua = FALSE;
+        result = IdeRunReadWrite(HwInit, Channel, Srb, Dev, Unit, Data, Lba, chunk, IsWrite, &noFua);
+        IdeLbaAdd(&Lba, chunk);
+        Count -= chunk;
+        Data += chunk * Dev->SectorSize;
+    }
+    return result;
+}
+
+/* A 64-bit byte count kept as two ULONGs */
+static VOID
+IdeAddBytes(IN OUT PULONG Pair, IN ULONG Bytes)
+{
+    Pair[0] += Bytes;
+    if (Pair[0] < Bytes) Pair[1]++;
+}
+
+/* TRIM mode: the write's data is the pattern, repeated from the first byte.
+   Any length: a file system splits a write at fragment boundaries, and
+   TRIMNT's pattern repeats every 512 bytes, so every piece still matches. */
 static BOOLEAN
 IdeIsTrimPattern(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR Data, IN ULONG Length)
 {
     ULONG i, j;
 
-    if (Data == NULL || Length < IDE_TRIM_PATTERN_SIZE) return FALSE;
+    if (Data == NULL || Length == 0) return FALSE;
     for (i = 0; i < Length; i += IDE_TRIM_PATTERN_SIZE) {
         for (j = 0; j < IDE_TRIM_PATTERN_SIZE && i + j < Length; j += 4) {
             if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(&HwInit->TrimPattern[j])) return FALSE;
@@ -1155,44 +1221,58 @@ IdeAtaReadWrite(
     }
     if (!IsWrite) Fua = FALSE;
 
-    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors */
-    if (IsWrite && HwInit->TrimMode && dev->Trim && dev->UseDma && HwInit->TrimAllowed &&
-        IdeIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
-        IdeCompleteResult(HwInit, Channel, Srb, IdeTrim(HwInit, Channel, unit, Lba, Count));
-        return;
-    }
-
-    /* flushAfter: FUA wanted and not done by the command itself */
-    flushAfter = Fua;
-    if (!IdeBuildReadWrite(dev, unit, Srb->DataBuffer, Lba, Count, IsWrite, TRUE, &flushAfter, &req)) {
-        IdeInvalidField(dev, Srb);
-        return;
-    }
-
-    if (dev->MaxSectors != 0 && (Count << dev->LbaShift) > dev->MaxSectors) {
-        /* A drive with a per-command limit (Silicon Image 3112 errata):
-           the request in pieces, one after the other */
-        PUCHAR data = (PUCHAR)Srb->DataBuffer;
-        ULONG chunk;
-        BOOLEAN noFua;
-
-        result = IDE_CMD_OK;
-        while (Count > 0 && result == IDE_CMD_OK) {
-            chunk = dev->MaxSectors >> dev->LbaShift;
-            if (chunk == 0) chunk = 1;
-            if (chunk > Count) chunk = Count;
-            noFua = FALSE;
-            result = IdeRunReadWrite(HwInit, Channel, Srb, dev, unit, data, Lba, chunk, IsWrite, &noFua);
-            IdeLbaAdd(&Lba, chunk);
-            Count -= chunk;
-            data += chunk * dev->SectorSize;
+    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors; on
+       a disk without TRIM it is written and counted */
+    if (IsWrite && HwInit->TrimMode && IdeIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
+        if (IDE_CAN_TRIM(HwInit, dev)) {
+            result = IdeTrim(HwInit, Channel, unit, Lba, Count);
+            if (result == IDE_CMD_OK) IdeAddBytes(HwInit->TrimmedBytes, Count * dev->SectorSize);
+            IdeCompleteResult(HwInit, Channel, Srb, result);
+            return;
         }
+        IdeAddBytes(HwInit->TrimWrittenBytes, Count * dev->SectorSize);
+    }
+
+    if (Count > IdePieceBlocks(dev)) {
+        /* More than one command takes (no 48-bit LBA, or a drive's own
+           limit such as the Silicon Image 3112 errata): pieces, each
+           started from the completion of the one before; a FUA write is
+           flushed after the last */
+        if (ch->Async && !HwInit->DumpMode) {
+            ch->ChainLeft = Count;
+            ch->ChainLba = Lba;
+            ch->ChainData = (PUCHAR)Srb->DataBuffer;
+            ch->ChainWrite = IsWrite;
+            ch->FlushAfter = Fua;
+            status = IdeIssuePiece(HwInit, Channel, Srb, dev, unit);
+            if (status == SRB_STATUS_PENDING) return;
+            ch->ChainLeft = 0;
+            ch->FlushAfter = FALSE;
+            if (status != SRB_STATUS_INVALID_REQUEST) {
+                if (status == SRB_STATUS_ERROR) {
+                    IdeSatlCompleteAtaError(HwInit, Channel, Srb);
+                } else {
+                    Srb->SrbStatus = status;
+                }
+                return;
+            }
+        }
+        result = IdeRunPieces(HwInit, Channel, Srb, dev, unit, (PUCHAR)Srb->DataBuffer, Lba, Count, IsWrite);
     } else {
-        /* Interrupt-completed DMA: a plain read or write (FUA needs the
-           flush afterwards, so it stays polled) */
-        if (req.UseDma && ch->Async && !flushAfter && !HwInit->DumpMode) {
+        /* flushAfter: FUA wanted and not done by the command itself */
+        flushAfter = Fua;
+        if (!IdeBuildReadWrite(dev, unit, Srb->DataBuffer, Lba, Count, IsWrite, TRUE, &flushAfter, &req)) {
+            IdeInvalidField(dev, Srb);
+            return;
+        }
+
+        /* Interrupt-completed DMA; a FUA write the drive has no FUA
+           command for is followed by FLUSH CACHE from its completion */
+        if (req.UseDma && ch->Async && !HwInit->DumpMode) {
+            ch->FlushAfter = flushAfter;
             status = IdeIssueDma(HwInit, Channel, Srb, &req);
             if (status == SRB_STATUS_PENDING) return;
+            ch->FlushAfter = FALSE;
             if (status != SRB_STATUS_INVALID_REQUEST) {
                 if (status == SRB_STATUS_ERROR) {
                     IdeSatlCompleteAtaError(HwInit, Channel, Srb);
@@ -1202,10 +1282,12 @@ IdeAtaReadWrite(
                 return;
             }
             /* No PRD table for this buffer: polled, with PIO */
-        } else if (!req.UseDma && ch->Async && !flushAfter && !HwInit->DumpMode) {
+        } else if (!req.UseDma && ch->Async && !HwInit->DumpMode) {
             /* PIO, block by block from the interrupt */
+            ch->FlushAfter = flushAfter;
             status = IdeIssuePio(HwInit, Channel, Srb, &req);
             if (status == SRB_STATUS_PENDING) return;
+            ch->FlushAfter = FALSE;
             if (status != SRB_STATUS_INVALID_REQUEST) {
                 if (status == SRB_STATUS_ERROR) {
                     IdeSatlCompleteAtaError(HwInit, Channel, Srb);
@@ -1881,7 +1963,61 @@ IdeSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
 VOID
 IdeSatlCompleteDma(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Channel, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Result)
 {
+    PIDE_CHANNEL ch = &HwInit->Channels[Channel];
     PIDE_DEVICE dev = IDE_DEV(HwInit, Channel, IDE_UNIT_OF_TARGET(Srb->TargetId));
+
+    /* The next piece of a request that takes several commands */
+    if (ch->ChainLeft != 0) {
+        if (Result == IDE_CMD_OK) {
+            ULONG unit = IDE_UNIT_OF_TARGET(Srb->TargetId);
+            UCHAR status = IdeIssuePiece(HwInit, Channel, Srb, dev, unit);
+
+            if (status == SRB_STATUS_PENDING) return;
+            if (status == SRB_STATUS_INVALID_REQUEST) {
+                Result = IdeRunPieces(HwInit, Channel, Srb, dev, unit, ch->ChainData, ch->ChainLba, ch->ChainLeft,
+                                      ch->ChainWrite);
+            } else {
+                ch->ChainLeft = 0;
+                ch->FlushAfter = FALSE;
+                if (status == SRB_STATUS_ERROR) {
+                    IdeSatlCompleteAtaError(HwInit, Channel, Srb);
+                } else {
+                    Srb->SrbStatus = status;
+                }
+                ScsiPortNotification(RequestComplete, HwInit, Srb);
+                return;
+            }
+        }
+        ch->ChainLeft = 0;
+    }
+
+    /* A FUA write went through the drive's cache: FLUSH CACHE (EXT) by
+       interrupt before the request completes (polled if it cannot go) */
+    if (ch->FlushAfter) {
+        ch->FlushAfter = FALSE;
+        if (Result == IDE_CMD_OK && !dev->IsAtapi && dev->IdentifyValid && (dev->Id[IDE_ID_CMDSET_1] & IDW82_WRITE_CACHE)) {
+            ATA_REQUEST req;
+            UCHAR status;
+
+            ZeroMemoryBytes(&req, sizeof(req));
+            req.Unit = (UCHAR)IDE_UNIT_OF_TARGET(Srb->TargetId);
+            req.Command = (UCHAR)(dev->FlushExt ? IDE_COMMAND_FLUSH_CACHE_EXT : IDE_COMMAND_FLUSH_CACHE);
+            req.TimeoutSec = IDE_POLL_TIMEOUT_POWER_SEC;
+            status = IdeIssuePio(HwInit, Channel, Srb, &req);
+            if (status == SRB_STATUS_PENDING) return;
+            if (status == SRB_STATUS_INVALID_REQUEST) {
+                if (!IdeFlushDevice(HwInit, Channel, req.Unit)) Result = IDE_CMD_DEVICE_ERROR;
+            } else {
+                if (status == SRB_STATUS_ERROR) {
+                    IdeSatlCompleteAtaError(HwInit, Channel, Srb);
+                } else {
+                    Srb->SrbStatus = status;
+                }
+                ScsiPortNotification(RequestComplete, HwInit, Srb);
+                return;
+            }
+        }
+    }
 
     if (Result == IDE_CMD_OK) {
         IdeGood(Srb);
@@ -2062,11 +2198,31 @@ IdeSmartVersion(IN PHW_DEVICE_EXTENSION HwInit, IN PIDE_SRB_IO_CONTROL Ctl, IN U
 }
 
 static VOID
-IdeFillInfo(IN PHW_DEVICE_EXTENSION HwInit, OUT PIDE_IOCTL_INFO Info)
+IdeTrimStatus(IN PHW_DEVICE_EXTENSION HwInit, IN OUT PIDE_TRIM_STATUS St)
+{
+    St->Flags = (UCHAR)(HwInit->TrimMode ? IDE_TRIM_STATUS_MODE_ON : 0);
+    St->BlockSize = 0;
+    if (St->PathId == 0 && St->Lun == 0 && St->TargetId < HwInit->ChannelCount * IDE_DEVICES_PER_CHANNEL) {
+        PIDE_DEVICE dev = IDE_DEVICE_OF_TARGET(HwInit, St->TargetId);
+        if (dev->Present && !dev->IsAtapi) {
+            St->Flags |= IDE_TRIM_STATUS_PRESENT;
+            if (IDE_CAN_TRIM(HwInit, dev)) St->Flags |= IDE_TRIM_STATUS_CAN_TRIM;
+            St->BlockSize = dev->SectorSize;
+        }
+    }
+    St->TrimmedLow = HwInit->TrimmedBytes[0];
+    St->TrimmedHigh = HwInit->TrimmedBytes[1];
+    St->WrittenLow = HwInit->TrimWrittenBytes[0];
+    St->WrittenHigh = HwInit->TrimWrittenBytes[1];
+}
+
+static VOID
+IdeFillInfo(IN PHW_DEVICE_EXTENSION HwInit, OUT PIDE_IOCTL_INFO Info, IN ULONG Size)
 {
     ULONG c, unit;
 
-    ZeroMemoryBytes(Info, sizeof(IDE_IOCTL_INFO));
+    ZeroMemoryBytes(Info, Size);
+    if (Size >= sizeof(IDE_IOCTL_INFO)) Info->NestedInterrupts = HwInit->NestedInterrupts;
     Info->Version = IDE_DRIVER_VERSION;
     Info->Flags = (HwInit->AsyncMode ? IDE_INFO_ASYNC : 0) |
                   (HwInit->Stopped ? IDE_INFO_POWERED_DOWN : 0) | (HwInit->TrimMode ? IDE_INFO_TRIM_MODE : 0);
@@ -2132,8 +2288,9 @@ IdeProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         ctl->ReturnCode = 0;
         switch (ctl->ControlCode) {
         case IDE_IOCTL_GET_INFO:
-            if (available >= sizeof(IDE_IOCTL_INFO)) {
-                IdeFillInfo(HwInit, (PIDE_IOCTL_INFO)((PUCHAR)ctl + ctl->HeaderLength));
+            if (available >= IDE_IOCTL_INFO_SIZE_V1) {
+                IdeFillInfo(HwInit, (PIDE_IOCTL_INFO)((PUCHAR)ctl + ctl->HeaderLength),
+                            available >= sizeof(IDE_IOCTL_INFO) ? sizeof(IDE_IOCTL_INFO) : IDE_IOCTL_INFO_SIZE_V1);
             } else {
                 ctl->ReturnCode = 1;
             }
@@ -2160,10 +2317,19 @@ IdeProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
                 break;
             }
             CopyMemoryBytes(HwInit->TrimPattern, (PUCHAR)ctl + ctl->HeaderLength, IDE_TRIM_PATTERN_SIZE);
+            HwInit->TrimmedBytes[0] = HwInit->TrimmedBytes[1] = 0;
+            HwInit->TrimWrittenBytes[0] = HwInit->TrimWrittenBytes[1] = 0;
             HwInit->TrimMode = TRUE;
             break;
         case IDE_IOCTL_TRIM_MODE_OFF:
             HwInit->TrimMode = FALSE;
+            break;
+        case IDE_IOCTL_TRIM_STATUS:
+            if (available >= sizeof(IDE_TRIM_STATUS)) {
+                IdeTrimStatus(HwInit, (PIDE_TRIM_STATUS)((PUCHAR)ctl + ctl->HeaderLength));
+            } else {
+                ctl->ReturnCode = 1;
+            }
             break;
         default:
             Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;

@@ -20,4 +20,5 @@ SOURCES=..\idemain.c \
         ..\idecmd.c \
         ..\idesatl.c \
         ..\idepnp.c \
+        ..\idepdo.c \
         ..\ident.rc

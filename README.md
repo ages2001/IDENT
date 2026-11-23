@@ -1,6 +1,6 @@
-# IDENT — PATA/SATA IDE Driver for Windows 95/98/Me and Windows NT 3.1 to XP x64
+# IDENT — PATA/SATA IDE Driver for Windows 95/98/Me and Windows NT 3.1 to 7 x64
 
-**IDENT** is a SCSI miniport driver for IDE controllers: parallel ATA, and SATA controllers running in IDE mode. It replaces the in-box `atdisk`, `atapi` and `ESDI_506` drivers of Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP and Server 2003 (x86 and x64) with one driver that gives every one of these systems UDMA, 48-bit LBA, native-mode controllers on any interrupt, large sectors, SMART and TRIM.
+**IDENT** is a SCSI miniport driver for IDE controllers: parallel ATA, and SATA controllers running in IDE mode. It replaces the in-box `atdisk`, `atapi` and `ESDI_506` drivers of Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP, Server 2003, Vista and 7 (x86 and x64) with one driver that gives every one of these systems UDMA, 48-bit LBA, native-mode controllers on any interrupt, large sectors, SMART and TRIM.
 
 | | |
 |---|---|
